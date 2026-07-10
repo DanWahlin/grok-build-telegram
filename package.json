@@ -1,0 +1,41 @@
+{
+  "name": "grok-build-telegram",
+  "version": "0.1.0",
+  "description": "Secure Telegram bridge for xAI Grok Build using the official Agent Client Protocol (ACP)",
+  "type": "module",
+  "license": "MIT",
+  "main": "dist/src/index.js",
+  "bin": {
+    "grok-build-telegram": "dist/src/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && chmod +x dist/src/index.js",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "smoke": "tsx scripts/smoke-acp.ts",
+    "start": "node dist/src/index.js",
+    "start:dev": "tsx src/index.ts",
+    "clean": "rm -rf dist .grok-telegram-state"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "^1.2.1",
+    "dotenv": "^17.4.2",
+    "grammy": "^1.44.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.3",
+    "tsx": "^4.23.0",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.7"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ]
+}

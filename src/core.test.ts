@@ -1,0 +1,50 @@
+import { describe, expect, it } from "vitest";
+import { chunkMessage, markdownToTelegramHtml } from "./telegram.js";
+import { sanitizePermissionText } from "./redact.js";
+import { createLockData, isAllowed, lockOwnedByCurrentProcess, type AccessState } from "./state.js";
+import type { Config } from "./config.js";
+
+const config = {
+  LOCK_STALE_AFTER_MS: 60_000,
+} as Config;
+
+describe("Telegram rendering", () => {
+  it("chunks text without losing content", () => {
+    const text = `${"a".repeat(12)}\n\n${"b".repeat(12)}`;
+    const chunks = chunkMessage(text, 15);
+    expect(chunks.length).toBeGreaterThan(1);
+    expect(chunks.join("\n\n").replace(/\n+/g, "\n")).toContain("a".repeat(12));
+    expect(chunks.join("\n\n")).toContain("b".repeat(12));
+  });
+
+  it("escapes untrusted HTML while preserving supported markdown", () => {
+    expect(markdownToTelegramHtml("**safe** <script>x</script>"))
+      .toContain("<b>safe</b> &lt;script&gt;x&lt;/script&gt;");
+  });
+});
+
+describe("redaction", () => {
+  it("redacts Telegram and API-like credentials", () => {
+    const result = sanitizePermissionText(
+      "TOKEN=secret-value 123456789:ABCDEFGHIJKLMNOPQRSTUVWX ghp_abcdefghijklmnopqrstuvwxyz",
+    );
+    expect(result).not.toContain("secret-value");
+    expect(result).not.toContain("ABCDEFGHIJKLMNOP");
+    expect(result).not.toContain("ghp_abc");
+    expect(result).toContain("[REDACTED]");
+  });
+});
+
+describe("access and locks", () => {
+  it("authorizes immutable numeric IDs as strings", () => {
+    const access: AccessState = { allowedUsers: ["42"], pending: {} };
+    expect(isAllowed(access, 42)).toBe(true);
+    expect(isAllowed(access, 43)).toBe(false);
+  });
+
+  it("recognizes a lock owned by this process", () => {
+    const lock = createLockData("test-session");
+    expect(lockOwnedByCurrentProcess(lock, "test-session")).toBe(true);
+    expect(lockOwnedByCurrentProcess(lock, "other-session")).toBe(false);
+  });
+});

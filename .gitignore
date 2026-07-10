@@ -1,0 +1,37 @@
+# Dependencies
+node_modules/
+
+# Build
+dist/
+*.tsbuildinfo
+
+# Environment and secrets
+.env
+.env.local
+.env.*.local
+
+# Runtime state (never commit)
+.grok-telegram-state/
+state/
+access.json
+lock.json
+health.json
+*.json.tmp
+
+# Logs and temp
+*.log
+tmp/
+tmp-*/
+*.tmp
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
+
+# Test artifacts
+coverage/
+.nyc_output/
