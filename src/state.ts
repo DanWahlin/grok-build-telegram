@@ -2,9 +2,10 @@ import {
   readFileSync,
   writeFileSync,
   mkdirSync,
+  chmodSync,
+  lstatSync,
   rmSync,
   renameSync,
-  existsSync,
 } from "node:fs";
 import { join } from "node:path";
 import { hostname, platform } from "node:os";
@@ -84,17 +85,26 @@ export function loadJsonOrDefault<T>(filePath: string, defaultValue: T): T {
   }
 }
 
-export function saveJsonAtomic(filePath: string, data: unknown, mode?: number): void {
+export function saveJsonAtomic(filePath: string, data: unknown, mode = 0o600): void {
   const dir = join(filePath, "..");
-  mkdirSync(dir, { recursive: true });
-  const tmp = filePath + ".tmp";
-  const opts = mode != null ? { mode } : undefined;
-  writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n", opts as any);
-  renameSync(tmp, filePath);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  if (lstatSync(dir).isSymbolicLink()) throw new Error(`Refusing symlink state directory: ${dir}`);
+  chmodSync(dir, 0o700);
+  const tmp = `${filePath}.${process.pid}.${messageSafeRandom()}.tmp`;
+  try {
+    writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n", { mode, flag: "wx" });
+    chmodSync(tmp, mode);
+    renameSync(tmp, filePath);
+    chmodSync(filePath, mode);
+  } finally {
+    try { rmSync(tmp, { force: true }); } catch {}
+  }
 }
 
 export function ensureStateDir(config: Config): void {
   mkdirSync(config.stateDir, { recursive: true, mode: 0o700 });
+  if (lstatSync(config.stateDir).isSymbolicLink()) throw new Error("STATE_DIR may not be a symlink");
+  chmodSync(config.stateDir, 0o700);
 }
 
 export function accessPath(config: Config): string {
@@ -202,8 +212,23 @@ export function createLockData(
   };
 }
 
-export function writeLock(config: Config, sessionId: string): void {
-  saveJsonAtomic(lockPath(config), createLockData(sessionId), 0o600);
+export function acquireLock(config: Config, sessionId: string): void {
+  const path = lockPath(config);
+  const data = createLockData(sessionId);
+  try {
+    writeFileSync(path, JSON.stringify(data, null, 2) + "\n", { mode: 0o600, flag: "wx" });
+    chmodSync(path, 0o600);
+    return;
+  } catch (error: any) {
+    if (error?.code !== "EEXIST") throw error;
+  }
+  const existing = readLock(config);
+  if (existing && !isLockStale(config, existing)) {
+    throw new Error(`Bot is already locked by pid ${existing.pid} on ${existing.hostname}`);
+  }
+  rmSync(path, { force: true });
+  writeFileSync(path, JSON.stringify(data, null, 2) + "\n", { mode: 0o600, flag: "wx" });
+  chmodSync(path, 0o600);
 }
 
 export function readLock(config: Config): LockData | null {
@@ -256,7 +281,7 @@ export function isLockStale(config: Config, lock: LockData | null): boolean {
     const current = getProcessStartToken(lock.pid);
     if (current && current !== lock.processStartToken) return true;
   }
-  return heartbeatExpired;
+  return false;
 }
 
 // --- Health ---

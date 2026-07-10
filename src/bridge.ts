@@ -3,21 +3,15 @@ import {
   ensureStateDir,
   reloadAccess,
   saveAccess,
-  writeLock,
-  readLock,
-  isLockStale,
+  acquireLock,
   removeLock,
   refreshLock,
   writeHealthSnapshot,
   getActivePrompt,
-  setActivePrompt,
   getPendingPermission,
   setPendingPermission,
-  startActivePrompt,
   clearActivePrompt,
   updateActivePromptActivity,
-  HealthSnapshot,
-  buildHealthSnapshot,
 } from "./state.js";
 import {
   createTelegramBot,
@@ -26,8 +20,6 @@ import {
   sendFormattedMessage,
   sendMessage,
   editMessageReplyMarkup,
-  answerCallbackQuery,
-  chunkMessage,
   resetStreamDraftState,
   finalizeStreamDrafts,
   startTyping,
@@ -59,6 +51,7 @@ let lastInboundPromptAt: string | null = null;
 let lastAcpEventAt: string | null = null;
 let lastToolEventAt: string | null = null;
 let watchdogTimer: NodeJS.Timeout | null = null;
+let lockHeartbeatTimer: NodeJS.Timeout | null = null;
 let connected = false;
 let currentBotUsername: string | null = null;
 
@@ -69,17 +62,8 @@ export function createBridge(config: Config): Bridge {
   let access = reloadAccess(config);
   saveAccess(config, access);
 
-  // lock check at startup
-  const existingLock = readLock(config);
-  if (existingLock && !isLockStale(config, existingLock)) {
-    console.error(
-      `[LOCK] Bot is locked by pid ${existingLock.pid} on ${existingLock.hostname}. Refusing to start.`
-    );
-    process.exit(1);
-  }
-
   const sessionIdForLock = `tg-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  writeLock(config, sessionIdForLock);
+  acquireLock(config, sessionIdForLock);
 
   function updateLastPoll() {
     lastPollAt = nowIso();
@@ -113,10 +97,10 @@ export function createBridge(config: Config): Bridge {
   }
 
   // Permission sender
-  async function sendPermissionCard(summary: string, id: string, options: any[]) {
+  async function sendPermissionCard(summary: string, id: string, _options: any[]) {
     const active = getActivePrompt();
     const chats = active ? [active.chatId] : [];
-    const keyboard = new (await import("grammy")).InlineKeyboard()
+    const keyboard = new InlineKeyboard()
       .text("✅ Approve", `grok:a:${id}`)
       .text("❌ Reject", `grok:r:${id}`);
     const msgs: Array<{ chatId: number; messageId: number }> = [];
@@ -200,15 +184,18 @@ export function createBridge(config: Config): Bridge {
       try {
         await acpClient.sendPrompt(text);
         await onPromptComplete(getCurrentAssistantText());
-      } catch (e: any) {
-        await sendMessage(chatId, `Error sending prompt: ${e.message}`).catch(() => {});
+      } catch (error) {
+        const correlationId = `grok-${Date.now().toString(36)}`;
+        console.error(`[${correlationId}] Grok prompt failed:`, sanitizePermissionText(error instanceof Error ? error.message : String(error), 500));
+        await sendMessage(chatId, `Grok Build couldn't complete that request. Reference: ${correlationId}`).catch(() => {});
         clearActivePrompt();
         stopTyping();
       }
     },
-    onCancel: async () => {
-      await acpClient.cancelCurrent();
+    onCancel: async (chatId: number, userId: number) => {
       const ap = getActivePrompt();
+      if (!ap || ap.chatId !== chatId || ap.userId !== userId) return false;
+      await acpClient.cancelCurrent();
       if (ap) {
         try {
           await sendMessage(ap.chatId, "Cancel sent to ACP.");
@@ -217,9 +204,13 @@ export function createBridge(config: Config): Bridge {
       clearActivePrompt();
       stopTyping();
       resetStreamDraftState();
+      return true;
     },
-    onNewSession: async () => {
+    onNewSession: async (chatId: number, userId: number) => {
+      const ap = getActivePrompt();
+      if (ap && (ap.chatId !== chatId || ap.userId !== userId)) return false;
       await acpClient.restart();
+      return true;
     },
     onStatus: async (chatId: number) => {
       const access = reloadAccess(config);
@@ -251,6 +242,10 @@ export function createBridge(config: Config): Bridge {
     getLastInboundAt: () => lastInboundPromptAt,
     getLastAcpAt: () => lastAcpEventAt,
     getLastToolAt: () => lastToolEventAt,
+    onUpdate: () => {
+      lastUpdateAt = nowIso();
+      updateLastPoll();
+    },
   };
 
   const bot = createTelegramBot(config, deps);
@@ -275,7 +270,7 @@ export function createBridge(config: Config): Bridge {
     }, 30000);
   }
 
-  async function maybeProgressNotice(ap: any, age: number | null, act: number | null) {
+  async function maybeProgressNotice(ap: any, age: number | null, _act: number | null) {
     if (!ap || age == null || age < config.PROGRESS_NOTICE_AFTER_MS) return;
     const lastAge = ap.lastProgressNoticeAt ? ageMs(ap.lastProgressNoticeAt) : 999999;
     if ((lastAge || 0) < config.PROGRESS_NOTICE_INTERVAL_MS) return;
@@ -313,8 +308,7 @@ export function createBridge(config: Config): Bridge {
         console.warn("[BRIDGE] Initial ACP connect failed (will retry on first prompt):", e.message);
       }
 
-      // Start Telegram polling (grammy start does the polling loop)
-    // We wrap to get update events for health
+    // Patch to capture bot identity before polling.
     const origStart = bot.start.bind(bot);
     bot.start = async (opts?: any) => {
       const me = await bot.api.getMe();
@@ -324,37 +318,24 @@ export function createBridge(config: Config): Bridge {
       return origStart(opts);
     };
 
-    // Patch to capture updates for lastUpdateAt (grammy middleware)
-    bot.use(async (ctx: any, next: any) => {
-      lastUpdateAt = nowIso();
-      updateLastPoll();
-      return next();
-    });
-
-    await bot.start({ allowed_updates: ["message", "callback_query"] });
-
     startWatchdog();
-
-    // Refresh lock periodically
-    setInterval(() => {
-      if (connected) refreshLock(config, sessionIdForLock);
-    }, 15000);
-
-    // On first connect notify paired users if any
-    const initialAccess = reloadAccess(config);
-    const chats = initialAccess.allowedUsers.map(Number);
-    if (chats.length > 0) {
-      for (const c of chats) {
-        sendMessage(c, "Grok Build bridge connected.").catch(() => {});
+    lockHeartbeatTimer = setInterval(() => {
+      if (!refreshLock(config, sessionIdForLock)) {
+        console.error("[LOCK] Lost poller lock ownership; shutting down.");
+        void shutdown();
       }
-    } else {
-      console.log("[BRIDGE] No paired users. Send a message to the bot to start pairing.");
+    }, 15000);
+    lockHeartbeatTimer.unref();
+
+    const initialAccess = reloadAccess(config);
+    if (initialAccess.allowedUsers.length === 0) {
+      console.log("[BRIDGE] No paired user. Send a private message to the bot to start pairing.");
     }
 
-    // Handle child exit / restart
-    // (acp handle manages internally on errors in practice)
-    process.on("SIGINT", () => shutdown());
-    process.on("SIGTERM", () => shutdown());
+    process.on("SIGINT", () => void shutdown());
+    process.on("SIGTERM", () => void shutdown());
+
+    await bot.start({ allowed_updates: ["message", "callback_query"] });
     } catch (error) {
       await shutdown();
       throw error;
@@ -367,6 +348,10 @@ export function createBridge(config: Config): Bridge {
     if (watchdogTimer) {
       clearInterval(watchdogTimer);
       watchdogTimer = null;
+    }
+    if (lockHeartbeatTimer) {
+      clearInterval(lockHeartbeatTimer);
+      lockHeartbeatTimer = null;
     }
     stopTyping();
     resetStreamDraftState();
@@ -383,8 +368,8 @@ export function createBridge(config: Config): Bridge {
 
     clearActivePrompt();
 
+    if (botInstance) await stopPolling(botInstance);
     if (acpHandle) await acpHandle.shutdown().catch(() => {});
-    if (botInstance) stopPolling(botInstance);
 
     removeLock(config, sessionIdForLock);
     writeHealthSnapshot(config, "shutdown", { connected: false }, { force: true });

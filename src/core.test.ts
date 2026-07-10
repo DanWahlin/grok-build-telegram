@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
 import { chunkMessage, markdownToTelegramHtml } from "./telegram.js";
+import { describe, expect, it } from "vitest";
 import { sanitizePermissionText } from "./redact.js";
 import { createLockData, isAllowed, lockOwnedByCurrentProcess, type AccessState } from "./state.js";
 import type { Config } from "./config.js";
@@ -26,11 +26,13 @@ describe("Telegram rendering", () => {
 describe("redaction", () => {
   it("redacts Telegram and API-like credentials", () => {
     const result = sanitizePermissionText(
-      "TOKEN=secret-value 123456789:ABCDEFGHIJKLMNOPQRSTUVWX ghp_abcdefghijklmnopqrstuvwxyz",
+      "TOKEN=secret-value 123456789:ABCDEFGHIJKLMNOPQRSTUVWX «redacted:ghp_…» Bearer abcdefghijklmnop DATABASE_URL=postgres://user:pass@example/db",
     );
     expect(result).not.toContain("secret-value");
     expect(result).not.toContain("ABCDEFGHIJKLMNOP");
     expect(result).not.toContain("ghp_abc");
+    expect(result).not.toContain("abcdefghijklmnop");
+    expect(result).not.toContain("user:pass");
     expect(result).toContain("[REDACTED]");
   });
 });

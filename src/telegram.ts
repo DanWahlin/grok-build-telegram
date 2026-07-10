@@ -1,18 +1,12 @@
-import { Bot, Context, InlineKeyboard } from "grammy";
+import { Bot } from "grammy";
 import { Config, CHUNK_MAX } from "./config.js";
 import {
   nowIso,
   sleep,
-  generatePairingCode,
-  messageSafeRandom,
   formatAge,
-  ageMs,
 } from "./utils.js";
-import { sanitizePermissionText } from "./redact.js";
 import {
-  AccessState,
   reloadAccess,
-  saveAccess,
   isAllowed,
   cleanExpiredPending,
   startPairing,
@@ -21,20 +15,14 @@ import {
   clearActivePrompt,
   getActivePrompt,
   getPendingPermission,
-  setPendingPermission,
-  getTypingStartedAt,
   setTypingStartedAt,
-  writeHealthSnapshot,
-  updateActivePromptActivity,
-  PendingPermissionState,
 } from "./state.js";
-import type { PermissionRequest } from "./acp-client.js"; // forward type
 
 export interface TelegramDeps {
   config: Config;
   onPrompt: (chatId: number, text: string, fromUserId: number) => Promise<void>;
-  onCancel: () => Promise<void>;
-  onNewSession: () => Promise<void>;
+  onCancel: (chatId: number, userId: number) => Promise<boolean>;
+  onNewSession: (chatId: number, userId: number) => Promise<boolean>;
   onStatus: (chatId: number) => Promise<void>;
   resolvePermission?: (decision: any, label: string, userDisplay: string) => Promise<boolean>;
   getBotUsername: () => string | null;
@@ -45,6 +33,7 @@ export interface TelegramDeps {
   getLastInboundAt: () => string | null;
   getLastAcpAt: () => string | null;
   getLastToolAt: () => string | null;
+  onUpdate?: () => void;
 }
 
 let bot: Bot | null = null;
@@ -158,10 +147,6 @@ function enqueue(fn: () => Promise<any>): Promise<any> {
     if (!sendQueueRunning) drainQueue();
   });
 }
-function enqueueBestEffort(fn: () => Promise<any>, _ctx = "") {
-  enqueue(fn).catch(() => {});
-}
-
 async function drainQueue() {
   sendQueueRunning = true;
   const pace = 50;
@@ -270,7 +255,7 @@ export function startTyping(chatIds: number[]) {
   setTypingStartedAt(Date.now());
   const doType = () => {
     for (const id of chatIds) {
-      enqueue(() => sendChatAction(id).catch(() => {}));
+      sendChatAction(id).catch(() => {});
     }
     if (bubbleActive) resetTypingDebounce();
   };
@@ -347,19 +332,19 @@ async function flushStreamDraft(chatId: number, force = false, config?: Config) 
     const text = draft.text;
     if (draft.messageId) {
       try {
-        await enqueue(() => editFormattedMessage(chatId, draft.messageId!, text));
+        await editFormattedMessage(chatId, draft.messageId!, text);
       } catch (err: any) {
         if (/message is not modified/i.test(err.message || "")) {
           // ok
         } else if (/message to edit not found/i.test(err.message || "")) {
-          const sent: any = await enqueue(() => sendFormattedMessage(chatId, text));
+          const sent: any = await sendFormattedMessage(chatId, text);
           draft.messageId = sent.message_id;
         } else {
           throw err;
         }
       }
     } else {
-      const sent: any = await enqueue(() => sendFormattedMessage(chatId, text));
+      const sent: any = await sendFormattedMessage(chatId, text);
       draft.messageId = sent.message_id;
     }
     draft.lastSentText = text;
@@ -474,8 +459,16 @@ export function updateToolCall(toolCallId: string, status?: string) {
 
 export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
   bot = new Bot(config.TELEGRAM_BOT_TOKEN);
+  bot.use(async (_ctx, next) => {
+    deps.onUpdate?.();
+    await next();
+  });
 
   bot.command(["start", "help"], async (ctx) => {
+    if (ctx.chat.type !== "private") {
+      await ctx.reply("This bridge only works in private chats.");
+      return;
+    }
     const help = [
       "Grok Build Telegram Bridge",
       "",
@@ -488,29 +481,35 @@ export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
   });
 
   bot.command("status", async (ctx) => {
+    const userId = ctx.from?.id;
+    const access = reloadAccess(config);
+    if (ctx.chat.type !== "private" || !userId || !isAllowed(access, userId)) {
+      await ctx.reply("Not authorized.");
+      return;
+    }
     await deps.onStatus(ctx.chat.id);
   });
 
   bot.command("cancel", async (ctx) => {
     const userId = ctx.from?.id;
     const access = reloadAccess(config);
-    if (!userId || !isAllowed(access, userId)) {
+    if (ctx.chat.type !== "private" || !userId || !isAllowed(access, userId)) {
       await ctx.reply("Not authorized.");
       return;
     }
-    await deps.onCancel();
-    await ctx.reply("Cancel requested.");
+    const cancelled = await deps.onCancel(ctx.chat.id, userId);
+    await ctx.reply(cancelled ? "Cancel requested." : "No active prompt owned by this chat.");
   });
 
   bot.command("new", async (ctx) => {
     const userId = ctx.from?.id;
     const access = reloadAccess(config);
-    if (!userId || !isAllowed(access, userId)) {
+    if (ctx.chat.type !== "private" || !userId || !isAllowed(access, userId)) {
       await ctx.reply("Not authorized.");
       return;
     }
-    await deps.onNewSession();
-    await ctx.reply("New session requested.");
+    const reset = await deps.onNewSession(ctx.chat.id, userId);
+    await ctx.reply(reset ? "New session started." : "Can't reset a session owned by another chat.");
   });
 
   bot.on("callback_query:data", async (ctx) => {
@@ -521,7 +520,7 @@ export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
     }
     const access = reloadAccess(config);
     const userIdStr = String(ctx.from?.id || "");
-    if (!isAllowed(access, userIdStr)) {
+    if (!isAllowed(access, userIdStr) || ctx.chat?.type !== "private") {
       await answerCallbackQuery(ctx.callbackQuery!.id, "Not authorized", true);
       return;
     }
@@ -565,6 +564,10 @@ export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
   bot.on("message", async (ctx) => {
     const message = ctx.message;
     if (!message) return;
+    if (ctx.chat.type !== "private") {
+      await ctx.reply("This bridge only works in private chats.");
+      return;
+    }
     const chatId = ctx.chat.id;
     const userId = ctx.from?.id;
     if (userId == null) return;
@@ -595,15 +598,23 @@ export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
       }
     }
 
+    if (!isAllowed(access, userId) && access.allowedUsers.length > 0) {
+      await ctx.reply("Pairing is closed. This bridge already has an owner.");
+      return;
+    }
     if (!isAllowed(access, userId)) {
-      // pairing flow
       cleanExpiredPending(config, access);
       const pending = access.pending?.[String(chatId)];
-      if (pending && text.trim().toUpperCase() === pending.code.toUpperCase()) {
-        if (completePairing(config, access, chatId, userId, pending.code)) {
+      if (pending) {
+        if (completePairing(config, access, chatId, userId, text.trim())) {
           await ctx.reply("Paired! You can now send prompts to Grok Build.");
           return;
         }
+        const remaining = Math.max(0, 5 - (pending.attempts ?? 0));
+        await ctx.reply(remaining > 0
+          ? `Invalid pairing code. ${remaining} attempt${remaining === 1 ? "" : "s"} remaining.`
+          : "Pairing cancelled after too many invalid attempts. Send another message to request a new code.");
+        return;
       }
       const code = startPairing(config, access, chatId);
       await ctx.reply(
@@ -629,7 +640,12 @@ export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
     startActivePrompt(chatId, message.message_id || 0, userId);
 
     const promptText = text || "User sent a non-text message.";
-    await deps.onPrompt(chatId, promptText, userId);
+    void deps.onPrompt(chatId, promptText, userId).catch(async () => {
+      clearActivePrompt();
+      stopTyping();
+      resetStreamDraftState();
+      await ctx.reply("Grok Build couldn't complete that request. Check the bridge logs for the correlation details.").catch(() => {});
+    });
   });
 
   return bot;
@@ -645,9 +661,9 @@ export async function startPolling(bot: Bot) {
   });
 }
 
-export function stopPolling(bot: Bot) {
+export async function stopPolling(bot: Bot): Promise<void> {
   try {
-    bot.stop();
+    await bot.stop();
   } catch {}
 }
 
@@ -684,4 +700,17 @@ export function scheduleAssistantDeltaFlush(chatIds: number[], config: Config) {
 
 export function getStreamDrafts() {
   return streamDrafts;
+}
+
+export function resetTelegramRuntimeForTests() {
+  stopTyping();
+  resetStreamDraftState();
+  sendQueue = [];
+  sendQueueRunning = false;
+  bot = null;
+  bubbleActive = false;
+}
+
+export function setTelegramTokenForTests(token: string) {
+  bot = { _token: token } as unknown as Bot;
 }

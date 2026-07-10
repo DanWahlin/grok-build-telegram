@@ -6,7 +6,7 @@ A single long-polling process owns the bot. Telegram messages become ACP `sessio
 
 ## Features
 
-- **Secure by default**: numeric allowlist + expiring 6-char pairing codes. Atomic 0600 state files.
+- **Secure by default**: private chats only, one numeric Telegram owner, expiring attempt-limited pairing codes, and atomic `0600` state files.
 - **One-poller lock**: PID + hostname + Linux start-time token + heartbeat; refuses duplicate pollers on stale detection.
 - **ACP permission forwarding**: inline Telegram buttons (Approve / Reject). Never silently approves unless `GROK_ALWAYS_APPROVE=true`.
 - **Streaming UX**: throttled draft edits + typing + progress notices + stalled watchdog.
@@ -78,8 +78,9 @@ npm audit --omit=dev
 ## Security
 
 - Never commit `.env`, state JSONs, or `access.json`.
-- The bridge only trusts explicitly paired numeric user IDs.
-- All permission decisions from Telegram are bound to the requesting user ID.
+- The bridge only trusts its first explicitly paired numeric user ID and only in a private chat.
+- The Grok ACP subprocess receives a strict environment allowlist, never the Telegram bot token.
+- All permission decisions and control commands are bound to the active owner/chat.
 - Use least-privilege `GROK_CWD` when possible.
 
 ## License

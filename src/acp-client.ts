@@ -43,6 +43,7 @@ export interface AcpClientHandle {
 
 export function createAcpClient(config: Config, handlers: AcpHandlers): AcpClientHandle {
   let child: ChildProcess | null = null;
+  let childExit: Promise<void> | null = null;
   let connection: acp.ClientConnection | null = null;
   let context: acp.ClientContext | null = null;
   let session: acp.ActiveSession | null = null;
@@ -50,10 +51,20 @@ export function createAcpClient(config: Config, handlers: AcpHandlers): AcpClien
   let connected = false;
   let promptRunning = false;
 
-  function stopChild(): void {
-    if (!child) return;
-    try { child.kill("SIGTERM"); } catch {}
+  async function stopChild(): Promise<void> {
+    const running = child;
+    const exited = childExit;
     child = null;
+    childExit = null;
+    if (!running) return;
+    try { running.kill("SIGTERM"); } catch {}
+    if (exited) {
+      const graceful = await Promise.race([exited.then(() => true), sleep(3000).then(() => false)]);
+      if (!graceful) {
+        try { running.kill("SIGKILL"); } catch {}
+        await Promise.race([exited, sleep(1000)]);
+      }
+    }
   }
 
   async function connect(): Promise<void> {
@@ -64,11 +75,21 @@ export function createAcpClient(config: Config, handlers: AcpHandlers): AcpClien
     if (config.GROK_ALWAYS_APPROVE) args.push("--always-approve");
     args.push("stdio");
 
+    const childEnv: NodeJS.ProcessEnv = {};
+    for (const key of ["HOME", "PATH", "LANG", "LC_ALL", "TERM", "TMPDIR", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "SSL_CERT_FILE", "SSL_CERT_DIR", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"]) {
+      const value = process.env[key];
+      if (value) childEnv[key] = value;
+    }
     child = spawn(config.grokBin, args, {
       cwd: config.grokCwdAbs,
-      stdio: ["pipe", "pipe", "inherit"],
-      env: { ...process.env },
+      stdio: ["pipe", "pipe", "pipe"],
+      env: childEnv,
       shell: false,
+    });
+    childExit = new Promise<void>((resolve) => child!.once("exit", () => resolve()));
+    child.stderr?.on("data", (chunk: Buffer) => {
+      const line = sanitizePermissionText(chunk.toString("utf8"), 1000);
+      if (line) console.error(`[GROK] ${line}`);
     });
     child.once("exit", (code, signal) => {
       connected = false;
@@ -148,7 +169,7 @@ export function createAcpClient(config: Config, handlers: AcpHandlers): AcpClien
     context = null;
     connection?.close();
     connection = null;
-    stopChild();
+    await stopChild();
   }
 
   async function restart(): Promise<void> {
