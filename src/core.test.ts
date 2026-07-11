@@ -2,6 +2,7 @@ import { chunkMessage, markdownToTelegramHtml } from "./telegram.js";
 import { describe, expect, it } from "vitest";
 import { sanitizePermissionText } from "./redact.js";
 import { createLockData, isAllowed, lockOwnedByCurrentProcess, type AccessState } from "./state.js";
+import { buildGrokChildEnv } from "./acp-client.js";
 import type { Config } from "./config.js";
 
 const config = {
@@ -34,6 +35,26 @@ describe("redaction", () => {
     expect(result).not.toContain("abcdefghijklmnop");
     expect(result).not.toContain("user:pass");
     expect(result).toContain("[REDACTED]");
+  });
+});
+
+describe("Grok subprocess environment", () => {
+  it("disables Claude-compatible MCPs and hooks without leaking bridge secrets", () => {
+    const childEnv = buildGrokChildEnv({
+      HOME: "/root",
+      PATH: "/usr/bin",
+      TELEGRAM_BOT_TOKEN: "telegram-secret",
+      XAI_API_KEY: "xai-secret",
+      GROK_CLAUDE_MCPS_ENABLED: "true",
+      GROK_CLAUDE_HOOKS_ENABLED: "true",
+    });
+
+    expect(childEnv.HOME).toBe("/root");
+    expect(childEnv.PATH).toBe("/usr/bin");
+    expect(childEnv.GROK_CLAUDE_MCPS_ENABLED).toBe("false");
+    expect(childEnv.GROK_CLAUDE_HOOKS_ENABLED).toBe("false");
+    expect(childEnv.TELEGRAM_BOT_TOKEN).toBeUndefined();
+    expect(childEnv.XAI_API_KEY).toBeUndefined();
   });
 });
 

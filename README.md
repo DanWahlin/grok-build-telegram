@@ -79,7 +79,7 @@ npm audit --omit=dev
 
 - Never commit `.env`, state JSONs, or `access.json`.
 - The bridge only trusts its first explicitly paired numeric user ID and only in a private chat.
-- The Grok ACP subprocess receives a strict environment allowlist, never the Telegram bot token.
+- The Grok ACP subprocess receives a strict environment allowlist, never the Telegram bot token. It also forces Claude-compatible MCP and hook discovery off, preventing an imported Claude Telegram plugin from launching a competing Bot API poller.
 - All permission decisions and control commands are bound to the active owner/chat.
 - Use least-privilege `GROK_CWD` when possible.
 

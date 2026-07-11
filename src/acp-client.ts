@@ -41,6 +41,21 @@ export interface AcpClientHandle {
   isConnected: () => boolean;
 }
 
+export function buildGrokChildEnv(parentEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const childEnv: NodeJS.ProcessEnv = {
+    // The bridge owns Telegram transport. Grok must not import Claude-compatible
+    // MCPs/hooks, especially the root Claude Telegram plugin, or it can launch a
+    // competing Bot API poller and wedge both bridges.
+    GROK_CLAUDE_MCPS_ENABLED: "false",
+    GROK_CLAUDE_HOOKS_ENABLED: "false",
+  };
+  for (const key of ["HOME", "PATH", "LANG", "LC_ALL", "TERM", "TMPDIR", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "SSL_CERT_FILE", "SSL_CERT_DIR", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"]) {
+    const value = parentEnv[key];
+    if (value) childEnv[key] = value;
+  }
+  return childEnv;
+}
+
 export function createAcpClient(config: Config, handlers: AcpHandlers): AcpClientHandle {
   let child: ChildProcess | null = null;
   let childExit: Promise<void> | null = null;
@@ -75,11 +90,7 @@ export function createAcpClient(config: Config, handlers: AcpHandlers): AcpClien
     if (config.GROK_ALWAYS_APPROVE) args.push("--always-approve");
     args.push("stdio");
 
-    const childEnv: NodeJS.ProcessEnv = {};
-    for (const key of ["HOME", "PATH", "LANG", "LC_ALL", "TERM", "TMPDIR", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "SSL_CERT_FILE", "SSL_CERT_DIR", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"]) {
-      const value = process.env[key];
-      if (value) childEnv[key] = value;
-    }
+    const childEnv = buildGrokChildEnv(process.env);
     child = spawn(config.grokBin, args, {
       cwd: config.grokCwdAbs,
       stdio: ["pipe", "pipe", "pipe"],
