@@ -1,5 +1,9 @@
 # Grok Build Telegram Bridge
 
+<p align="center">
+  <img src="images/logo.webp" alt="Grok Build Telegram logo" width="400">
+</p>
+
 Secure Telegram bridge for xAI Grok Build using the official [Agent Client Protocol (ACP)](https://agentclientprotocol.com) over `grok agent --model grok-build stdio`.
 
 A single long-polling process owns the bot. Telegram messages become ACP `session/prompt` turns. ACP stream updates become throttled Telegram draft edits, tool bubbles, final replies, and interactive permission cards.
@@ -9,7 +13,7 @@ A single long-polling process owns the bot. Telegram messages become ACP `sessio
 - **Secure by default**: private chats only, one numeric Telegram owner, expiring attempt-limited pairing codes, and atomic `0600` state files.
 - **One-poller lock**: PID + hostname + Linux start-time token + heartbeat; refuses duplicate pollers on stale detection.
 - **ACP permission forwarding**: inline Telegram buttons (Approve / Reject). Never silently approves unless `GROK_ALWAYS_APPROVE=true`.
-- **Streaming UX**: throttled draft edits + typing + progress notices + stalled watchdog.
+- **Streaming UX**: throttled draft edits, ordered multi-message finals, typing, live tool-progress bubbles, progress notices, and a stalled watchdog.
 - **Commands**: `/start`, `/help`, `/status`, `/new`, `/cancel`.
 - **Redaction**: tokens, keys, and secrets are stripped from permission summaries and health.
 - **Health snapshots**: `health.json` with precise state for debugging.
@@ -56,6 +60,10 @@ See `.env.example`. Key variables:
 
 - `GROK_ALWAYS_APPROVE` — **insecure**. Only set true for trusted fully-automated setups.
 - `STATE_DIR` — where `access.json`, `lock.json`, `health.json` live (mode 0700 dir, 0600 files).
+- `SEND_PACE_MS`, `API_TIMEOUT_MS` — outbound Telegram queue pacing and API timeout.
+- `TYPING_INTERVAL_MS`, `TYPING_DEBOUNCE_MS`, `MAX_TYPING_SESSION_MS` — typing cadence and limits.
+- `STREAM_EDIT_INTERVAL_MS`, `STREAM_MIN_DELTA_CHARS`, `STREAM_DRAFT_MAX` — streaming draft throttling.
+- `PROGRESS_NOTICE_*` — progress notice timing and maximum notice count.
 
 ## Architecture Notes
 
@@ -63,12 +71,14 @@ See `.env.example`. Key variables:
 - Prompts are processed serially; while busy a new message is rejected with guidance.
 - Permissions use ACP `requestPermission` handler and map to Telegram callbacks bound to opaque IDs.
 - Draft streaming uses edit throttling + force flush on final.
+- Tool calls create one progress bubble in the active authorized prompt chat, edit it as tools change, and delete it when the prompt ends.
 - Watchdog sends ⏳ progress notices after long inactivity and warns on stall.
 
 ## Development
 
 ```bash
 npm run typecheck
+npm run lint
 npm run build
 npm test
 npm run smoke   # live ACP-only smoke (no Telegram)

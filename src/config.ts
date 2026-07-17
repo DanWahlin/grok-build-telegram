@@ -28,16 +28,12 @@ const EnvSchema = z.object({
   PROGRESS_NOTICE_INTERVAL_MS: z.coerce.number().int().positive().default(10 * 60 * 1000),
   PROGRESS_NOTICE_ITERATION_MS: z.coerce.number().int().positive().default(60 * 1000),
   PROGRESS_NOTICE_MAX_ITERATIONS: z.coerce.number().int().positive().default(90),
-  POLL_TIMEOUT: z.coerce.number().int().positive().default(30),
-  ERROR_RETRY_BASE_MS: z.coerce.number().int().positive().default(5000),
-  ERROR_RETRY_MAX_MS: z.coerce.number().int().positive().default(60000),
-  SEND_PACE_MS: z.coerce.number().int().positive().default(50),
+  SEND_PACE_MS: z.coerce.number().int().nonnegative().default(50),
   TYPING_INTERVAL_MS: z.coerce.number().int().positive().default(4000),
   TYPING_DEBOUNCE_MS: z.coerce.number().int().positive().default(60000),
   HEALTH_WRITE_MIN_INTERVAL_MS: z.coerce.number().int().positive().default(5000),
   API_TIMEOUT_MS: z.coerce.number().int().positive().default(30000),
   PERMISSION_SUMMARY_MAX: z.coerce.number().int().positive().default(1800),
-  ASK_USER_TIMEOUT_MS: z.coerce.number().int().positive().default(5 * 60 * 1000),
 });
 
 export type Config = z.infer<typeof EnvSchema> & {
@@ -54,7 +50,7 @@ export function loadConfig(): Config {
   let grokBin = parsed.GROK_BIN;
   if (!grokBin || grokBin === "grok") {
     // Prefer the known grok location if present
-    const home = (process.env as any)["HOME"];
+    const home = process.env["HOME"];
     const candidates = [
       "/root/.grok/bin/grok",
       home ? `${home}/.grok/bin/grok` : null,
@@ -77,4 +73,3 @@ export function loadConfig(): Config {
 }
 
 export const CHUNK_MAX = 4096;
-export const PROTOCOL_VERSION = 1; // ACP

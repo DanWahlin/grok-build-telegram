@@ -40,7 +40,7 @@
 - Route Telegram prompts serially into ACP.
 - Handle `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`, and `plan` updates.
 - Persist the ACP session ID and expose it in health/status output.
-- Restart the ACP subprocess with bounded backoff after unexpected exits.
+- Reconnect the ACP subprocess on the next prompt after an unexpected exit.
 
 ## Milestone 5: Permission forwarding
 

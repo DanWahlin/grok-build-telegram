@@ -10,7 +10,7 @@ import type {
 } from "@agentclientprotocol/sdk";
 import type { Config } from "./config.js";
 import { messageSafeRandom, nowIso, sleep } from "./utils.js";
-import { sanitizePermissionText } from "./redact.js";
+import { sanitizedError, sanitizePermissionText } from "./redact.js";
 import {
   getPendingPermission,
   setPendingPermission,
@@ -72,11 +72,19 @@ export function createAcpClient(config: Config, handlers: AcpHandlers): AcpClien
     child = null;
     childExit = null;
     if (!running) return;
-    try { running.kill("SIGTERM"); } catch {}
+    try {
+      running.kill("SIGTERM");
+    } catch (error: unknown) {
+      console.warn(`[ACP] Failed to terminate Grok process: ${sanitizedError(error)}`);
+    }
     if (exited) {
       const graceful = await Promise.race([exited.then(() => true), sleep(3000).then(() => false)]);
       if (!graceful) {
-        try { running.kill("SIGKILL"); } catch {}
+        try {
+          running.kill("SIGKILL");
+        } catch (error: unknown) {
+          console.warn(`[ACP] Failed to kill unresponsive Grok process: ${sanitizedError(error)}`);
+        }
         await Promise.race([exited, sleep(1000)]);
       }
     }
@@ -174,7 +182,11 @@ export function createAcpClient(config: Config, handlers: AcpHandlers): AcpClien
   async function shutdown(): Promise<void> {
     connected = false;
     promptRunning = false;
-    try { session?.dispose(); } catch {}
+    try {
+      session?.dispose();
+    } catch (error: unknown) {
+      console.warn(`[ACP] Failed to dispose session: ${sanitizedError(error)}`);
+    }
     session = null;
     sessionId = null;
     context = null;
@@ -244,6 +256,5 @@ export async function handlePermissionForward(
   setPendingPermission(pending);
   writeHealthSnapshot(config, "permission-requested", {
     connected: true,
-    pendingPermission: true,
   }, { force: true });
 }

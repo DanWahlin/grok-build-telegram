@@ -5,13 +5,10 @@ import { join } from "node:path";
 import { createTelegramBot, resetTelegramRuntimeForTests } from "./telegram.js";
 import { saveAccess } from "./state.js";
 import type { Config } from "./config.js";
+import { createTestConfig } from "./test-support.js";
 
 function makeConfig(stateDir: string): Config {
-  return {
-    TELEGRAM_BOT_TOKEN: "123456789:test-token-not-real",
-    stateDir,
-    PAIRING_EXPIRY_MS: 300_000,
-  } as Config;
+  return createTestConfig(stateDir, { SEND_PACE_MS: 0 });
 }
 
 function makeDeps(config: Config) {
@@ -21,14 +18,6 @@ function makeDeps(config: Config) {
     onCancel: vi.fn(async () => true),
     onNewSession: vi.fn(async () => true),
     onStatus: vi.fn(async () => {}),
-    getBotUsername: () => "test_bot",
-    getAcpSessionId: () => "session",
-    getConnected: () => true,
-    getLastPollAt: () => null,
-    getLastUpdateAt: () => null,
-    getLastInboundAt: () => null,
-    getLastAcpAt: () => null,
-    getLastToolAt: () => null,
   };
 }
 
@@ -42,10 +31,11 @@ describe("Telegram authorization and prompt dispatch", () => {
       const bot = createTelegramBot(config, deps);
       (bot as any).botInfo = { id: 999, is_bot: true, first_name: "Test", username: "test_bot", can_join_groups: false, can_read_all_group_messages: false, supports_inline_queries: false };
       const replies: string[] = [];
-      (bot.api as any).config.use((_prev: any, method: string, payload: any) => {
-        if (method === "sendMessage") replies.push(payload.text);
-        return { ok: true, result: { message_id: 1, date: 0, chat: { id: -10, type: "group" }, text: payload.text } };
-      });
+      vi.stubGlobal("fetch", vi.fn(async (_input: string | URL, init?: RequestInit) => {
+        const payload = JSON.parse(String(init?.body)) as { text?: string };
+        if (payload.text) replies.push(payload.text);
+        return new Response(JSON.stringify({ ok: true, result: { message_id: 1 } }));
+      }));
 
       await bot.handleUpdate({
         update_id: 1,
@@ -62,6 +52,7 @@ describe("Telegram authorization and prompt dispatch", () => {
       expect(replies).toContain("This bridge only works in private chats.");
       resetTelegramRuntimeForTests();
     } finally {
+      vi.unstubAllGlobals();
       rmSync(dir, { recursive: true, force: true });
     }
   });
@@ -76,10 +67,11 @@ describe("Telegram authorization and prompt dispatch", () => {
       const deps = { ...makeDeps(config), onPrompt: vi.fn(() => blocked) };
       const bot = createTelegramBot(config, deps);
       (bot as any).botInfo = { id: 999, is_bot: true, first_name: "Test", username: "test_bot", can_join_groups: false, can_read_all_group_messages: false, supports_inline_queries: false };
-      (bot.api as any).config.use((_prev: any, method: string, payload: any) => ({
-        ok: true,
-        result: method === "setMessageReaction" ? true : { message_id: 1, date: 0, chat: { id: 42, type: "private" }, text: payload.text },
-      }));
+      vi.stubGlobal("fetch", vi.fn(async (input: string | URL) =>
+        new Response(JSON.stringify({
+          ok: true,
+          result: String(input).endsWith("/setMessageReaction") ? true : { message_id: 1 },
+        }))));
 
       const handled = bot.handleUpdate({
         update_id: 2,
@@ -99,6 +91,7 @@ describe("Telegram authorization and prompt dispatch", () => {
       release();
       resetTelegramRuntimeForTests();
     } finally {
+      vi.unstubAllGlobals();
       rmSync(dir, { recursive: true, force: true });
     }
   });

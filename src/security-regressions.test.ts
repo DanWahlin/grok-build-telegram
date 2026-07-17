@@ -1,12 +1,21 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import {
+  chmodSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   acquireLock,
+  buildHealthSnapshot,
   completePairing,
   ensureStateDir,
   readLock,
+  reloadAccess,
   removeLock,
   saveJsonAtomic,
   startPairing,
@@ -15,23 +24,19 @@ import {
 import {
   resetTelegramRuntimeForTests,
   sendMessage,
-  setTelegramTokenForTests,
+  setTelegramRuntimeForTests,
   startTyping,
 } from "./telegram.js";
-import type { Config } from "./config.js";
+import { createTestConfig } from "./test-support.js";
 
-function configFor(dir: string): Config {
-  return {
-    stateDir: dir,
-    PAIRING_EXPIRY_MS: 300_000,
-    LOCK_STALE_AFTER_MS: 1_000,
-  } as Config;
+function configFor(dir: string) {
+  return createTestConfig(dir, { LOCK_STALE_AFTER_MS: 1_000 });
 }
 
 describe("Telegram outbound queue", () => {
   beforeEach(() => {
     vi.useFakeTimers();
-    setTelegramTokenForTests("test-token");
+    setTelegramRuntimeForTests("test-token", createTestConfig("/tmp"));
   });
 
   afterEach(() => {
@@ -52,7 +57,7 @@ describe("Telegram outbound queue", () => {
 
     startTyping([42]);
     const sent = sendMessage(42, "hello");
-    await vi.runAllTimersAsync();
+    await vi.advanceTimersByTimeAsync(100);
     await sent;
 
     expect(methods).toContain("sendChatAction");
@@ -101,5 +106,40 @@ describe("pairing and state hardening", () => {
     expect(readLock(config)?.sessionId).toBe("first");
     expect(() => acquireLock(config, "second")).toThrow(/already locked/);
     removeLock(config, "first");
+  });
+
+  it("falls back safely when state JSON has the wrong shape", () => {
+    const config = configFor(dir);
+    ensureStateDir(config);
+    writeFileSync(join(dir, "access.json"), JSON.stringify({ allowedUsers: "42", pending: [] }));
+    writeFileSync(join(dir, "lock.json"), JSON.stringify({ pid: "not-a-number" }));
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    expect(reloadAccess(config)).toEqual({ allowedUsers: [], pending: {} });
+    expect(readLock(config)).toBeNull();
+    expect(warning).toHaveBeenCalledTimes(2);
+  });
+
+  it("populates bot identity and matching health timestamp fields", () => {
+    const config = configFor(dir);
+    const snapshot = buildHealthSnapshot(config, "test", {
+      connected: true,
+      botName: "Grok Bridge",
+      botUsername: "grok_bridge_bot",
+      lastInboundPromptAt: "2026-01-02T03:04:05.000Z",
+      lastAcpEventAt: "2026-01-02T03:04:06.000Z",
+      lastToolEventAt: "2026-01-02T03:04:07.000Z",
+    });
+
+    expect(snapshot.botName).toBe("Grok Bridge");
+    expect(snapshot.botUsername).toBe("grok_bridge_bot");
+    expect(snapshot.lastInboundPromptAt).toBe("2026-01-02T03:04:05.000Z");
+    expect(snapshot.lastAcpEventAt).toBe("2026-01-02T03:04:06.000Z");
+    expect(snapshot.lastToolEventAt).toBe("2026-01-02T03:04:07.000Z");
+
+    const partialUpdate = buildHealthSnapshot(config, "acp-update", { connected: true });
+    expect(partialUpdate.botName).toBe("Grok Bridge");
+    expect(partialUpdate.botUsername).toBe("grok_bridge_bot");
+    expect(partialUpdate.lastInboundPromptAt).toBe("2026-01-02T03:04:05.000Z");
   });
 });

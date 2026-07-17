@@ -19,14 +19,7 @@ export function sanitizePermissionText(text: string | null | undefined, maxLen =
   return s.slice(0, maxLen).trim() || "permission request";
 }
 
-export function redactForLog(obj: unknown): string {
-  try {
-    const s = JSON.stringify(obj, (k, v) => {
-      if (typeof k === "string" && /(token|secret|key|password|auth|cookie)/i.test(k)) return "[REDACTED]";
-      return v;
-    });
-    return sanitizePermissionText(s, 2000);
-  } catch {
-    return "[unstringifiable]";
-  }
+export function sanitizedError(error: unknown, maxLen = 500): string {
+  // Error objects are reduced to their message; structured objects are not serialized.
+  return sanitizePermissionText(error instanceof Error ? error.message : String(error), maxLen);
 }

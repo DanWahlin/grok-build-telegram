@@ -12,10 +12,6 @@ export function messageSafeRandom(): string {
   return randomBytes(8).toString("hex");
 }
 
-export function generatePairingCode(): string {
-  return randomBytes(4).toString("hex").slice(0, 6);
-}
-
 export function parseTimeMs(value: string | null | undefined): number | null {
   const ts = Date.parse(value || "");
   return Number.isFinite(ts) ? ts : null;

@@ -9,19 +9,21 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { hostname, platform } from "node:os";
-import { Config } from "./config.js";
+import { z, type ZodType } from "zod";
+import type { PermissionOption, RequestPermissionResponse } from "@agentclientprotocol/sdk";
+import type { Config } from "./config.js";
 import { nowIso, parseTimeMs, ageMs, messageSafeRandom } from "./utils.js";
-import { sanitizePermissionText } from "./redact.js";
+import { sanitizedError, sanitizePermissionText } from "./redact.js";
 
 export interface AccessState {
   allowedUsers: string[];
-  pending: Record<string, { code: string; timestamp: number; attempts?: number }>;
+  pending: Record<string, { code: string; timestamp: number; attempts?: number | undefined }>;
 }
 
 export interface LockData {
   pid: number;
   sessionId: string;
-  botName?: string;
+  botName?: string | undefined;
   hostname: string;
   processStartToken: string | null;
   processStartTokenSource: string;
@@ -71,12 +73,43 @@ export interface HealthSnapshot {
 }
 
 const DEFAULT_ACCESS: AccessState = { allowedUsers: [], pending: {} };
+const PendingPairingSchema = z.object({
+  code: z.string().min(1),
+  timestamp: z.number().finite(),
+  attempts: z.number().int().nonnegative().optional(),
+});
+const AccessStateSchema: ZodType<AccessState> = z.object({
+  allowedUsers: z.array(z.string()),
+  pending: z.record(z.string(), PendingPairingSchema),
+});
+const LockDataSchema: ZodType<LockData> = z.object({
+  pid: z.number().int().positive(),
+  sessionId: z.string().min(1),
+  botName: z.string().optional(),
+  hostname: z.string(),
+  processStartToken: z.string().nullable(),
+  processStartTokenSource: z.string(),
+  connectedAt: z.string(),
+  updatedAt: z.string(),
+});
 
-export function loadJsonOrDefault<T>(filePath: string, defaultValue: T): T {
+function isErrnoException(error: unknown): error is NodeJS.ErrnoException {
+  return error instanceof Error && "code" in error;
+}
+
+export function loadJsonOrDefault<T>(
+  filePath: string,
+  defaultValue: T,
+  schema: ZodType<T>,
+): T {
   try {
-    return JSON.parse(readFileSync(filePath, "utf-8"));
-  } catch (err: any) {
-    if (err.code === "ENOENT") return structuredClone(defaultValue);
+    const parsed: unknown = JSON.parse(readFileSync(filePath, "utf-8"));
+    const validated = schema.safeParse(parsed);
+    if (validated.success) return validated.data;
+    console.warn(`grok-telegram: invalid state shape in ${filePath}, using defaults`);
+    return structuredClone(defaultValue);
+  } catch (err: unknown) {
+    if (isErrnoException(err) && err.code === "ENOENT") return structuredClone(defaultValue);
     if (err instanceof SyntaxError) {
       console.warn(`grok-telegram: corrupted JSON in ${filePath}, using defaults`);
       return structuredClone(defaultValue);
@@ -97,7 +130,11 @@ export function saveJsonAtomic(filePath: string, data: unknown, mode = 0o600): v
     renameSync(tmp, filePath);
     chmodSync(filePath, mode);
   } finally {
-    try { rmSync(tmp, { force: true }); } catch {}
+    try {
+      rmSync(tmp, { force: true });
+    } catch (error: unknown) {
+      console.warn(`grok-telegram: failed to remove temporary state file: ${sanitizedError(error)}`);
+    }
   }
 }
 
@@ -118,7 +155,7 @@ export function healthPath(config: Config): string {
 }
 
 export function reloadAccess(config: Config): AccessState {
-  return loadJsonOrDefault(accessPath(config), DEFAULT_ACCESS);
+  return loadJsonOrDefault(accessPath(config), DEFAULT_ACCESS, AccessStateSchema);
 }
 
 export function saveAccess(config: Config, access: AccessState): void {
@@ -219,8 +256,8 @@ export function acquireLock(config: Config, sessionId: string): void {
     writeFileSync(path, JSON.stringify(data, null, 2) + "\n", { mode: 0o600, flag: "wx" });
     chmodSync(path, 0o600);
     return;
-  } catch (error: any) {
-    if (error?.code !== "EEXIST") throw error;
+  } catch (error: unknown) {
+    if (!isErrnoException(error) || error.code !== "EEXIST") throw error;
   }
   const existing = readLock(config);
   if (existing && !isLockStale(config, existing)) {
@@ -232,9 +269,11 @@ export function acquireLock(config: Config, sessionId: string): void {
 }
 
 export function readLock(config: Config): LockData | null {
-  const data = loadJsonOrDefault<LockData | null>(lockPath(config), null);
-  if (!data || !data.pid || !data.sessionId) return null;
-  return data;
+  return loadJsonOrDefault<LockData | null>(
+    lockPath(config),
+    null,
+    LockDataSchema.nullable(),
+  );
 }
 
 export function lockOwnedByCurrentProcess(lock: LockData | null, sessionId: string): boolean {
@@ -260,7 +299,9 @@ export function removeLock(config: Config, sessionId: string): void {
   if (lockOwnedByCurrentProcess(lock, sessionId)) {
     try {
       rmSync(lockPath(config), { force: true });
-    } catch {}
+    } catch (error: unknown) {
+      console.warn(`grok-telegram: failed to remove lock: ${sanitizedError(error)}`);
+    }
   }
 }
 
@@ -287,6 +328,19 @@ export function isLockStale(config: Config, lock: LockData | null): boolean {
 // --- Health ---
 
 let lastHealthWriteAt = 0;
+interface ResolvedHealthInput {
+  connected: boolean;
+  botName: string | null;
+  botUsername: string | null;
+  acpSessionId: string | null;
+  lastPollAt: string | null;
+  lastUpdateAt: string | null;
+  lastInboundPromptAt: string | null;
+  lastAcpEventAt: string | null;
+  lastToolEventAt: string | null;
+  typingActive: boolean;
+}
+const healthInputByStateDir = new Map<string, ResolvedHealthInput>();
 
 export interface ActivePromptState {
   id: string;
@@ -306,31 +360,31 @@ export interface PendingPermissionState {
   summary: string;
   startedAt: string;
   timer: NodeJS.Timeout;
-  resolve: (outcome: any) => void;
+  resolve: (outcome: RequestPermissionResponse) => void;
   messages: Array<{ chatId: number; messageId: number }>;
-  rawRequest?: any;
+  rawRequest?: { options: PermissionOption[] };
 }
 
 let activePrompt: ActivePromptState | null = null;
 let pendingPermission: PendingPermissionState | null = null;
 let typingStartedAt: number | null = null;
 
-export function getActivePrompt() {
+export function getActivePrompt(): ActivePromptState | null {
   return activePrompt;
 }
-export function setActivePrompt(p: ActivePromptState | null) {
+export function setActivePrompt(p: ActivePromptState | null): void {
   activePrompt = p;
 }
-export function getPendingPermission() {
+export function getPendingPermission(): PendingPermissionState | null {
   return pendingPermission;
 }
-export function setPendingPermission(p: PendingPermissionState | null) {
+export function setPendingPermission(p: PendingPermissionState | null): void {
   pendingPermission = p;
 }
-export function getTypingStartedAt() {
+export function getTypingStartedAt(): number | null {
   return typingStartedAt;
 }
-export function setTypingStartedAt(t: number | null) {
+export function setTypingStartedAt(t: number | null): void {
   typingStartedAt = t;
 }
 
@@ -347,32 +401,64 @@ export function startActivePrompt(chatId: number, messageId: number, userId = ch
     progressNoticeCount: 0,
     lastProgressNoticeAt: null,
   };
-  return activePrompt!;
+  return activePrompt;
 }
 
-export function clearActivePrompt() {
+export function clearActivePrompt(): void {
   activePrompt = null;
 }
 
-export function recordAcpEvent(kind?: string) {
-  // side effect captured via health write in caller
+export interface HealthSnapshotInput {
+  connected: boolean;
+  botName?: string | null;
+  botUsername?: string | null;
+  acpSessionId?: string | null;
+  lastPollAt?: string | null;
+  lastUpdateAt?: string | null;
+  lastInboundPromptAt?: string | null;
+  lastAcpEventAt?: string | null;
+  lastToolEventAt?: string | null;
+  typingActive?: boolean;
+}
+
+function resolveHealthInput(config: Config, extra: HealthSnapshotInput): ResolvedHealthInput {
+  const previous = healthInputByStateDir.get(config.stateDir);
+  const resolved: ResolvedHealthInput = {
+    connected: extra.connected,
+    botName: extra.botName !== undefined ? extra.botName : previous?.botName ?? null,
+    botUsername: extra.botUsername !== undefined
+      ? extra.botUsername
+      : previous?.botUsername ?? null,
+    acpSessionId: extra.acpSessionId !== undefined
+      ? extra.acpSessionId
+      : previous?.acpSessionId ?? null,
+    lastPollAt: extra.lastPollAt !== undefined ? extra.lastPollAt : previous?.lastPollAt ?? null,
+    lastUpdateAt: extra.lastUpdateAt !== undefined
+      ? extra.lastUpdateAt
+      : previous?.lastUpdateAt ?? null,
+    lastInboundPromptAt: extra.lastInboundPromptAt !== undefined
+      ? extra.lastInboundPromptAt
+      : previous?.lastInboundPromptAt ?? null,
+    lastAcpEventAt: extra.lastAcpEventAt !== undefined
+      ? extra.lastAcpEventAt
+      : previous?.lastAcpEventAt ?? null,
+    lastToolEventAt: extra.lastToolEventAt !== undefined
+      ? extra.lastToolEventAt
+      : previous?.lastToolEventAt ?? null,
+    typingActive: extra.typingActive !== undefined
+      ? extra.typingActive
+      : previous?.typingActive ?? false,
+  };
+  healthInputByStateDir.set(config.stateDir, resolved);
+  return resolved;
 }
 
 export function buildHealthSnapshot(
   config: Config,
   reason: string,
-  extra: {
-    connected: boolean;
-    botUsername?: string | null;
-    acpSessionId?: string | null;
-    lastPollAt?: string | null;
-    lastUpdateAt?: string | null;
-    lastInboundPromptAt?: string | null;
-    lastAcpEventAt?: string | null;
-    lastToolEventAt?: string | null;
-    typingActive?: boolean;
-  }
+  extra: HealthSnapshotInput,
 ): HealthSnapshot {
+  const resolved = resolveHealthInput(config, extra);
   const ap = activePrompt;
   const pp = pendingPermission;
   const promptAge = ap ? ageMs(ap.startedAt) : null;
@@ -382,18 +468,18 @@ export function buildHealthSnapshot(
   const snapshot: HealthSnapshot = {
     reason,
     updatedAt: nowIso(),
-    connected: extra.connected,
+    connected: resolved.connected,
     pid: process.pid,
-    sessionId: extra.acpSessionId || null,
-    botName: null,
-    botUsername: extra.botUsername || null,
+    sessionId: resolved.acpSessionId,
+    botName: resolved.botName,
+    botUsername: resolved.botUsername,
     hostname: hostname(),
-    lastPollAt: extra.lastPollAt || null,
-    lastUpdateAt: extra.lastUpdateAt || null,
-    lastInboundPromptAt: extra.lastInboundPromptAt || null,
-    lastAcpEventAt: extra.lastAcpEventAt || null,
-    lastToolEventAt: extra.lastToolEventAt || null,
-    typingActive: !!extra.typingActive,
+    lastPollAt: resolved.lastPollAt,
+    lastUpdateAt: resolved.lastUpdateAt,
+    lastInboundPromptAt: resolved.lastInboundPromptAt,
+    lastAcpEventAt: resolved.lastAcpEventAt,
+    lastToolEventAt: resolved.lastToolEventAt,
+    typingActive: resolved.typingActive,
     typingAgeMs: typingAge,
     activePrompt: ap
       ? {
@@ -420,8 +506,8 @@ export function buildHealthSnapshot(
           messageCount: pp.messages?.length || 0,
         }
       : null,
-    acpSessionId: extra.acpSessionId || null,
-    likelyState: getLikelyState(extra.connected, !!pp, !!(promptActivityAge != null && promptActivityAge > config.PROMPT_STALE_AFTER_MS), !!ap),
+    acpSessionId: resolved.acpSessionId,
+    likelyState: getLikelyState(resolved.connected, !!pp, !!(promptActivityAge != null && promptActivityAge > config.PROMPT_STALE_AFTER_MS), !!ap),
   };
   return snapshot;
 }
@@ -442,7 +528,7 @@ function getLikelyState(
 export function writeHealthSnapshot(
   config: Config,
   reason: string,
-  extra: any,
+  extra: HealthSnapshotInput,
   { force = true }: { force?: boolean } = {}
 ): void {
   const now = Date.now();
@@ -452,8 +538,8 @@ export function writeHealthSnapshot(
     const snap = buildHealthSnapshot(config, reason, extra);
     saveJsonAtomic(healthPath(config), snap, 0o600);
     lastHealthWriteAt = now;
-  } catch (err: any) {
-    console.error("grok-telegram: failed to write health snapshot:", err.message);
+  } catch (err: unknown) {
+    console.error(`grok-telegram: failed to write health snapshot: ${sanitizedError(err)}`);
   }
 }
 
