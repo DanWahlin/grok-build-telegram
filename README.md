@@ -4,95 +4,176 @@
   <img src="images/logo.webp" alt="Grok Build Telegram logo" width="400">
 </p>
 
-Secure Telegram bridge for xAI Grok Build using the official [Agent Client Protocol (ACP)](https://agentclientprotocol.com) over `grok agent --model grok-build stdio`.
-
-A single long-polling process owns the bot. Telegram messages become ACP `session/prompt` turns. ACP stream updates become throttled Telegram draft edits, tool bubbles, final replies, and interactive permission cards.
+Run an xAI Grok Build coding-agent session from a private Telegram chat. The bridge uses the official [Agent Client Protocol (ACP)](https://agentclientprotocol.com) over `grok agent --model grok-build stdio`; it does not expose an inbound HTTP server or Telegram webhook.
 
 ## Features
 
-- **Secure by default**: private chats only, one numeric Telegram owner, expiring attempt-limited pairing codes, and atomic `0600` state files.
-- **One-poller lock**: PID + hostname + Linux start-time token + heartbeat; refuses duplicate pollers on stale detection.
-- **ACP permission forwarding**: inline Telegram buttons (Approve / Reject). Never silently approves unless `GROK_ALWAYS_APPROVE=true`.
-- **Streaming UX**: throttled draft edits, ordered multi-message finals, typing, live tool-progress bubbles, progress notices, and a stalled watchdog.
-- **Commands**: `/start`, `/help`, `/status`, `/new`, `/cancel`.
-- **Redaction**: tokens, keys, and secrets are stripped from permission summaries and health.
-- **Health snapshots**: `health.json` with precise state for debugging.
-- **Clean shutdown**: cancels in-flight work, removes locks, cleans drafts/permissions.
+- **Secure by default**: private chats only, one numeric Telegram owner, expiring attempt-limited pairing codes, and atomic owner-only state files.
+- **Interactive permissions**: approve or reject ACP tool requests from Telegram. Permissions are never approved automatically unless `GROK_ALWAYS_APPROVE=true`.
+- **Streaming responses**: throttled draft edits, ordered multi-message final responses, typing indicators, tool-progress bubbles, progress notices, and stall detection.
+- **Single-poller protection**: a PID, hostname, process-start token, and heartbeat lock prevent competing bridge instances.
+- **Operational visibility**: `/status` and `health.json` report session, prompt, permission, polling, and tool activity.
+- **Secret isolation**: the Telegram token is not passed to the Grok subprocess, and sensitive values are redacted from permission summaries and logs.
 
 ## Requirements
 
-- Node.js 24+
-- Grok CLI with `grok-build` model access (`/root/.grok/bin/grok` or in PATH)
-- A Telegram bot token from @BotFather
+- Node.js 24 or later
+- A locally installed and authenticated Grok CLI with access to the `grok-build` model
+- A Telegram bot token from [@BotFather](https://t.me/BotFather)
 
-## Quick Start
+## Quick start
 
-1. Clone and install:
+1. Clone the repository and install dependencies:
 
    ```bash
+   git clone https://github.com/DanWahlin/grok-build-telegram.git
    cd grok-build-telegram
    npm install
    cp .env.example .env
    ```
 
-2. Edit `.env` and set `TELEGRAM_BOT_TOKEN` and `GROK_CWD` (absolute path recommended).
+2. Edit `.env`:
 
-3. Pair yourself:
+   ```dotenv
+   TELEGRAM_BOT_TOKEN=your-bot-token
+   GROK_CWD=/absolute/path/to/the/project
+   ```
+
+   `GROK_CWD` is the directory the Grok agent can inspect and modify. Use the narrowest practical project directory.
+
+3. Start the bridge in development mode:
 
    ```bash
    npm run start:dev
    ```
 
-   Send any message to the bot. The bot asks for a pairing code, while the one-time code is printed only in the bridge terminal. Copy that code into Telegram within five minutes. Pairing attempts are rate-limited and the runtime access file is stored with mode `0600`.
+4. Open a private chat with the bot and send a message. The one-time pairing code appears only in the bridge terminal. Send that code to the bot within five minutes.
 
-4. Talk to Grok Build from Telegram.
+5. Send a text prompt. The bridge keeps one persistent ACP session and processes one prompt at a time.
 
-## Commands (in Telegram)
+### Production start
 
-- `/start`, `/help` — usage
-- `/status` — health, session, last activity, pending permission
-- `/new` — stop the current Grok ACP subprocess and create a fresh session
-- `/cancel` — send ACP `session/cancel` for the current prompt turn
+Build the TypeScript output and run the compiled entry point:
+
+```bash
+npm run build
+npm start
+```
+
+Run only one bridge process for a bot token. Use a process supervisor if the bridge must restart automatically.
+
+## Telegram commands
+
+| Command | Behavior |
+| --- | --- |
+| `/start`, `/help` | Show usage and pairing guidance |
+| `/status` | Show bridge, ACP session, prompt, permission, and activity status |
+| `/new` | Stop the current Grok subprocess and create a fresh ACP session |
+| `/cancel` | Request cancellation of the active ACP prompt |
 
 ## Configuration
 
-See `.env.example`. Key variables:
+Copy `.env.example` to `.env`. The primary settings are:
 
-- `GROK_ALWAYS_APPROVE` — **insecure**. Only set true for trusted fully-automated setups.
-- `STATE_DIR` — where `access.json`, `lock.json`, `health.json` live (mode 0700 dir, 0600 files).
-- `SEND_PACE_MS`, `API_TIMEOUT_MS` — outbound Telegram queue pacing and API timeout.
-- `TYPING_INTERVAL_MS`, `TYPING_DEBOUNCE_MS`, `MAX_TYPING_SESSION_MS` — typing cadence and limits.
-- `STREAM_EDIT_INTERVAL_MS`, `STREAM_MIN_DELTA_CHARS`, `STREAM_DRAFT_MAX` — streaming draft throttling.
-- `PROGRESS_NOTICE_*` — progress notice timing and maximum notice count.
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `TELEGRAM_BOT_TOKEN` | Required | Token issued by @BotFather |
+| `GROK_CWD` | Current directory | Working directory available to Grok |
+| `GROK_BIN` | `grok` | Grok executable path; common user locations are also detected |
+| `GROK_MODEL` | `grok-build` | Model passed to `grok agent` |
+| `STATE_DIR` | `./.grok-telegram-state` | Directory for access, lock, and health state |
+| `GROK_ALWAYS_APPROVE` | `false` | Automatically approve ACP permissions; unsafe outside a fully trusted environment |
 
-## Architecture Notes
+`.env.example` documents all optional timing controls for pairing, permissions, streaming, typing, progress notices, health writes, API calls, and outbound pacing.
 
-- One persistent ACP session per bridge lifetime.
-- Prompts are processed serially; while busy a new message is rejected with guidance.
-- Permissions use ACP `requestPermission` handler and map to Telegram callbacks bound to opaque IDs.
-- Draft streaming uses edit throttling + force flush on final.
-- Tool calls create one progress bubble in the active authorized prompt chat, edit it as tools change, and delete it when the prompt ends.
-- Watchdog sends ⏳ progress notices after long inactivity and warns on stall.
+## How it works
+
+```text
+Private Telegram message
+        |
+        v
+Authorization and single-prompt gate
+        |
+        v
+Persistent ACP session over Grok stdio
+        |
+        +--> streamed text --> Telegram draft and final messages
+        |
+        +--> tool updates --> Telegram progress bubble
+        |
+        +--> permission request --> owner-bound approve/reject controls
+```
+
+- `grammY` long-polls Telegram. No webhook endpoint is opened.
+- Prompts are serialized. A second prompt is rejected while one is active.
+- Assistant output is HTML-escaped, rendered from a limited Markdown subset, and split at Telegram's message limit.
+- Tool and permission controls are sent only to the authorized chat that owns the active prompt.
+- Outbound Telegram operations share one paced queue with retry handling for rate limits.
+
+## Runtime state
+
+The bridge creates these files under `STATE_DIR`:
+
+| File | Contents |
+| --- | --- |
+| `access.json` | Authorized user ID and temporary pairing state |
+| `lock.json` | Single-poller ownership and heartbeat |
+| `health.json` | Current bridge, Telegram, ACP, prompt, and permission status |
+
+The state directory is forced to mode `0700` and state files to `0600`. Do not commit or share them.
+
+## Security model and limitations
+
+- The first successfully paired Telegram user becomes the only owner. Pairing closes after that.
+- Commands, prompts, callbacks, and permission decisions are accepted only from the owner in a private chat.
+- Pairing codes expire and allow at most five attempts. They are attempt-limited, not a general-purpose remote authentication system.
+- The Grok subprocess receives an explicit environment allowlist and never receives `TELEGRAM_BOT_TOKEN`.
+- ACP permission decisions are bound to the active request, owner, and chat.
+- `GROK_ALWAYS_APPROVE=true` removes the interactive safety boundary. Leave it disabled unless the agent and working directory are fully trusted.
+- The bridge forwards text and captions. Telegram media and file contents are not sent to ACP.
+- One bridge supports one owner, one Grok subprocess, and one active prompt at a time.
+- Use a least-privilege operating-system account and a narrowly scoped `GROK_CWD`.
+
+## Troubleshooting
+
+**The bot reports another poller or exits with a conflict**
+
+Another process is using the same bot token. Stop the other process before restarting this bridge. Do not delete `lock.json` while a bridge process is still running.
+
+**No pairing code appears in Telegram**
+
+The code is intentionally printed only in the bridge terminal. Send any message to the bot in a private chat, then check the terminal output.
+
+**Grok does not connect**
+
+Confirm that `GROK_BIN` points to a working CLI, the CLI is already authenticated, `GROK_CWD` exists, and this command works locally:
+
+```bash
+grok agent --model grok-build stdio
+```
+
+**A prompt appears stalled**
+
+Use `/status` and inspect `STATE_DIR/health.json`. The watchdog reports inactivity after `PROMPT_STALE_AFTER_MS`.
 
 ## Development
 
 ```bash
 npm run typecheck
 npm run lint
-npm run build
 npm test
-npm run smoke   # live ACP-only smoke (no Telegram)
-npm audit --omit=dev
+npm run build
+npm audit
 ```
 
-## Security
+Run the live ACP-only smoke test when a working Grok CLI is available:
 
-- Never commit `.env`, state JSONs, or `access.json`.
-- The bridge only trusts its first explicitly paired numeric user ID and only in a private chat.
-- The Grok ACP subprocess receives a strict environment allowlist, never the Telegram bot token. It also forces Claude-compatible MCP and hook discovery off, preventing an imported Claude Telegram plugin from launching a competing Bot API poller.
-- All permission decisions and control commands are bound to the active owner/chat.
-- Use least-privilege `GROK_CWD` when possible.
+```bash
+npm run smoke
+```
+
+See [`AGENTS.md`](AGENTS.md) for repository structure, security invariants, testing guidance, and contributor expectations.
 
 ## License
 
-MIT
+[MIT](LICENSE)

@@ -38,6 +38,8 @@
   },
   "files": [
     "dist",
+    "images/logo.webp",
+    "AGENTS.md",
     "README.md",
     "LICENSE"
   ]
