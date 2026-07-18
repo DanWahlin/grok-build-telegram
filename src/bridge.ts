@@ -8,9 +8,6 @@ import {
   refreshLock,
   writeHealthSnapshot,
   getActivePrompt,
-  getPendingPermission,
-  takePendingPermission,
-  cancelPendingPermissionState,
   clearActivePrompt,
   updateActivePromptActivity,
   getTypingStartedAt,
@@ -26,16 +23,13 @@ import {
   setLastUsage,
   getSessionCwd,
   setSessionCwd,
-  getPlanMessageId,
   setPlanMessageId,
-  getThoughtDraft,
   setThoughtDraft,
   resetSessionUiState,
   dequeuePrompt,
   clearPromptQueue,
   promptQueueLength,
   startActivePrompt,
-  type ActivePromptState,
   type HealthSnapshotInput,
 } from "./state.js";
 import {
@@ -44,14 +38,7 @@ import {
   beginOutboundShutdown,
   closeOutboundQueue,
   sendMessage,
-  editPermissionMessage,
   editMessageReplyMarkup,
-  editFormattedMessage,
-  sendFormattedMessage,
-  expiredPermissionText,
-  pendingPermissionText,
-  permissionKeyboard,
-  resolvedPermissionText,
   resetStreamDraftState,
   resetAndWaitForStreamDrafts,
   finalizeStreamDrafts,
@@ -65,7 +52,6 @@ import {
   trackToolCall,
   updateToolCall,
   getToolsSeenCount,
-  stalePromptKeyboard,
   type PromptPayload,
   type TelegramDeps,
 } from "./telegram.js";
@@ -77,12 +63,10 @@ import {
 } from "./acp-client.js";
 import type {
   ContentBlock,
-  PermissionOption,
-  RequestPermissionResponse,
   SessionUpdate,
 } from "@agentclientprotocol/sdk";
-import { nowIso, formatAge, ageMs, sleep } from "./utils.js";
-import { sanitizedError, sanitizePermissionText } from "./redact.js";
+import { nowIso, sleep } from "./utils.js";
+import { sanitizedError } from "./redact.js";
 import {
   buildPromptBlocks,
   cleanupInboxFiles,
@@ -96,6 +80,9 @@ import {
 import { Bot } from "grammy";
 import { resolve } from "node:path";
 import { existsSync, realpathSync, statSync } from "node:fs";
+import { createPermissionCards } from "./bridge-permissions.js";
+import { createBridgeUi } from "./bridge-ui.js";
+import { createWatchdog } from "./bridge-watchdog.js";
 
 export interface Bridge {
   start: () => Promise<void>;
@@ -185,104 +172,17 @@ export function createBridge(config: Config, factories: BridgeFactories = {}): B
     return acpHandle?.getCwd() ?? getSessionCwd(config.grokCwdAbs);
   }
 
-  async function sendPermissionCard(
-    summary: string,
-    id: string,
-    options: PermissionOption[],
-  ): Promise<Array<{ chatId: number; messageId: number }>> {
-    const active = getActivePrompt();
-    const chats = active ? [active.chatId] : [];
-    const keyboard = permissionKeyboard(id, options);
-    const msgs: Array<{ chatId: number; messageId: number }> = [];
-    const safeSummary = sanitizePermissionText(summary, config.PERMISSION_SUMMARY_MAX);
-    const text = pendingPermissionText(safeSummary);
-    if (chats.length === 0) {
-      throw new Error("No active Telegram chat available for ACP permission request");
-    }
-    let lastError: unknown;
-    for (const chatId of chats) {
-      try {
-        const sent = await sendMessage(chatId, text, { reply_markup: keyboard });
-        msgs.push({ chatId, messageId: sent.message_id });
-      } catch (error: unknown) {
-        console.error(`[TG] Permission card delivery failed: ${sanitizedError(error)}`);
-        lastError = error;
-      }
-    }
-    if (msgs.length === 0 && lastError) throw lastError;
-    return msgs;
-  }
-
-  async function resolvePermissionFromTelegram(
-    decision: RequestPermissionResponse,
-    label: string,
-    _userDisplay: string,
-  ): Promise<boolean> {
-    const pp = takePendingPermission();
-    if (!pp) return false;
-    clearTimeout(pp.timer);
-    pp.resolve(decision);
-    writeHealthSnapshot(config, "permission-resolved", buildExtra(), { force: true });
-    for (const m of pp.messages) {
-      try {
-        await editPermissionMessage(
-          m.chatId,
-          m.messageId,
-          resolvedPermissionText(pp.summary, label),
-        );
-      } catch (error: unknown) {
-        console.warn(`[TG] Permission confirmation cleanup failed: ${sanitizedError(error)}`);
-        try {
-          await editMessageReplyMarkup(m.chatId, m.messageId, null);
-          await sendMessage(m.chatId, `${label} (via Telegram)`);
-        } catch (fallbackError: unknown) {
-          console.warn(`[TG] Permission confirmation fallback failed: ${sanitizedError(fallbackError)}`);
-        }
-      }
-    }
-    return true;
-  }
-
-  async function expirePermissionCards(
-    summary: string,
-    messages: Array<{ chatId: number; messageId: number }>,
-  ): Promise<void> {
-    for (const message of messages) {
-      try {
-        await editPermissionMessage(
-          message.chatId,
-          message.messageId,
-          expiredPermissionText(summary),
-        );
-      } catch (error: unknown) {
-        console.warn(`[TG] Failed to expire permission card: ${sanitizedError(error)}`);
-        try {
-          await editMessageReplyMarkup(message.chatId, message.messageId, null);
-        } catch (fallbackError: unknown) {
-          console.warn(`[TG] Failed to clear expired permission buttons: ${sanitizedError(fallbackError)}`);
-        }
-      }
-    }
-  }
-
-  function cancelPendingPermission(): Promise<void> | null {
-    const pending = cancelPendingPermissionState();
-    if (!pending) return null;
-    return expirePermissionCards(pending.summary, pending.messages).catch((error: unknown) => {
-      console.warn(`[TG] Pending permission card cleanup failed: ${sanitizedError(error)}`);
-    });
-  }
-
-  async function clearStalePromptCard(active: ActivePromptState | null): Promise<void> {
-    if (!active?.staleMessageId) return;
-    try {
-      await editMessageReplyMarkup(active.chatId, active.staleMessageId, null);
-    } catch (error: unknown) {
-      console.warn(`[TG] Failed to clear stale prompt buttons: ${sanitizedError(error)}`);
-    } finally {
-      active.staleMessageId = null;
-    }
-  }
+  const reportHealth = (reason: string): void => {
+    writeHealthSnapshot(config, reason, buildExtra(), { force: true });
+  };
+  const {
+    sendPermissionCard,
+    expirePermissionCards,
+    resolvePermissionFromTelegram,
+    cancelPendingPermission,
+  } = createPermissionCards(config, reportHealth);
+  const { clearStalePromptCard, upsertPlanMessage, updateThoughtStream } = createBridgeUi(config);
+  const { runWatchdog } = createWatchdog(config, reportHealth);
 
   function trackPromptUiTask(promptId: string, operation: Promise<void>): void {
     let tasks = promptUiTasks.get(promptId);
@@ -306,56 +206,6 @@ export function createBridge(config: Config, factories: BridgeFactories = {}): B
       const tasks = promptUiTasks.get(promptId);
       if (!tasks?.size) return;
       await Promise.all([...tasks]);
-    }
-  }
-
-  async function upsertPlanMessage(chatId: number, text: string, promptId: string): Promise<void> {
-    if (getActivePrompt()?.id !== promptId) return;
-    const existing = getPlanMessageId(chatId);
-    if (existing) {
-      try {
-        await editFormattedMessage(chatId, existing, text);
-        return;
-      } catch (error: unknown) {
-        if (!(error instanceof Error && /message to edit not found/i.test(error.message))) {
-          console.warn(`[TG] Plan edit failed: ${sanitizedError(error)}`);
-        }
-        if (getActivePrompt()?.id === promptId) setPlanMessageId(chatId, null);
-      }
-    }
-    if (getActivePrompt()?.id !== promptId) return;
-    try {
-      const sent = await sendFormattedMessage(chatId, text);
-      if (getActivePrompt()?.id === promptId) setPlanMessageId(chatId, sent.message_id);
-    } catch (error: unknown) {
-      console.warn(`[TG] Plan send failed: ${sanitizedError(error)}`);
-    }
-  }
-
-  async function updateThoughtStream(chatId: number, delta: string, promptId: string): Promise<void> {
-    if (!getVerboseMode() || getActivePrompt()?.id !== promptId) return;
-    let draft = getThoughtDraft(chatId);
-    if (!draft) draft = { messageId: null, text: "", lastEditAt: 0 };
-    draft.text = (draft.text + delta).slice(-3500);
-    const now = Date.now();
-    if (draft.messageId && now - draft.lastEditAt < config.THOUGHT_EDIT_INTERVAL_MS) {
-      setThoughtDraft(chatId, draft);
-      return;
-    }
-    const body = `💭 Thinking…\n${draft.text}`;
-    try {
-      if (draft.messageId) {
-        await editFormattedMessage(chatId, draft.messageId, body);
-      } else {
-        const sent = await sendFormattedMessage(chatId, body);
-        if (getActivePrompt()?.id !== promptId) return;
-        draft.messageId = sent.message_id;
-      }
-      if (getActivePrompt()?.id !== promptId) return;
-      draft.lastEditAt = now;
-      setThoughtDraft(chatId, draft);
-    } catch (error: unknown) {
-      console.warn(`[TG] Thought stream update failed: ${sanitizedError(error)}`);
     }
   }
 
@@ -602,12 +452,7 @@ export function createBridge(config: Config, factories: BridgeFactories = {}): B
           await finalizeStreamDrafts(textFromStream, chats, config);
         } catch (error: unknown) {
           console.error(`[TG] Final response delivery failed: ${sanitizedError(error)}`);
-          setLastFinalResponse({
-            chatId: chats[0]!,
-            text: textFromStream,
-            savedAt: Date.now(),
-          });
-          // Keep the response available for /retry last.
+          // The response is still saved for /retry last by the block below.
         }
       } else if (chats.length) {
         resetStreamDraftState();
@@ -951,63 +796,6 @@ export function createBridge(config: Config, factories: BridgeFactories = {}): B
       trackPromptUiTask(active.id, runWatchdog(active));
     }, config.WATCHDOG_INTERVAL_MS);
     watchdogTimer.unref();
-  }
-
-  async function runWatchdog(ap: ActivePromptState): Promise<void> {
-    if (getActivePrompt()?.id !== ap.id || ap.cancelling) return;
-    const age = ageMs(ap.startedAt);
-    const activityAge = ageMs(ap.lastActivityAt ?? ap.startedAt);
-    await maybeProgressNotice(ap, age);
-    if (getActivePrompt()?.id !== ap.id) return;
-    if (
-      activityAge != null
-      && activityAge > config.PROMPT_STALE_AFTER_MS
-      && !ap.warningSent
-    ) {
-      ap.warningSent = true;
-      stopTyping();
-      resetStreamDraftState();
-      await dismissBubble();
-      if (getActivePrompt()?.id !== ap.id) return;
-      try {
-        const sent = await sendMessage(
-          ap.chatId,
-          `⚠️ ACP appears stalled (${formatAge(activityAge)} without activity).`,
-          { reply_markup: stalePromptKeyboard(ap.id) },
-        );
-        if (getActivePrompt()?.id === ap.id) {
-          ap.staleMessageId = sent.message_id;
-        } else {
-          await editMessageReplyMarkup(ap.chatId, sent.message_id, null);
-        }
-      } catch (error: unknown) {
-        console.warn(`[WATCHDOG] Stale notice failed: ${sanitizedError(error)}`);
-      }
-      writeHealthSnapshot(config, "stalled", buildExtra(), { force: true });
-    }
-  }
-
-  async function maybeProgressNotice(
-    ap: ActivePromptState,
-    age: number | null,
-  ): Promise<void> {
-    if (getActivePrompt()?.id !== ap.id) return;
-    if (age == null || age < config.PROGRESS_NOTICE_AFTER_MS) return;
-    if (ap.progressNoticeCount >= config.PROGRESS_NOTICE_MAX_ITERATIONS) return;
-    const lastAge = ap.lastProgressNoticeAt ? ageMs(ap.lastProgressNoticeAt) : 999999;
-    if ((lastAge || 0) < config.PROGRESS_NOTICE_INTERVAL_MS) return;
-    ap.progressNoticeCount += 1;
-    ap.lastProgressNoticeAt = nowIso();
-    const iteration = Math.min(
-      config.PROGRESS_NOTICE_MAX_ITERATIONS,
-      Math.max(1, Math.ceil(age / config.PROGRESS_NOTICE_ITERATION_MS)),
-    );
-    const detail = getPendingPermission() ? "waiting permission" : "working";
-    if (getActivePrompt()?.id !== ap.id) return;
-    await sendMessage(
-      ap.chatId,
-      `⏳ Still working... ${formatAge(age)} — ${detail} (${iteration}/${config.PROGRESS_NOTICE_MAX_ITERATIONS})`,
-    );
   }
 
   async function start(): Promise<void> {

@@ -142,11 +142,11 @@ export function guessMime(fileName: string, telegramMime?: string | null): strin
   return EXT_MIME[ext] ?? "application/octet-stream";
 }
 
-export function isImageMime(mime: string): boolean {
+function isImageMime(mime: string): boolean {
   return mime.startsWith("image/");
 }
 
-export function isAudioMime(mime: string): boolean {
+function isAudioMime(mime: string): boolean {
   return mime.startsWith("audio/");
 }
 
@@ -156,11 +156,6 @@ export function isAllowedMime(mime: string, allowlist: string[]): boolean {
   // Allow type/* wildcards in allowlist
   const [type] = normalized.split("/");
   return allowlist.includes(`${type}/*`);
-}
-
-export function inboxDir(root: RootIdentity): string {
-  validateRootIdentity(root);
-  return join(root.path, ".tg-inbox");
 }
 
 interface InboxDirectoryHandle {

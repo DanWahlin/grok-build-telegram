@@ -1,20 +1,8 @@
 import { Bot, type Context } from "grammy";
-import type {
-  InlineKeyboardMarkup,
-  Message,
-  ReactionTypeEmoji,
-} from "grammy/types";
-import type {
-  PermissionOption,
-  RequestPermissionResponse,
-  ToolCallStatus,
-} from "@agentclientprotocol/sdk";
+import type { ReactionTypeEmoji } from "grammy/types";
+import type { RequestPermissionResponse } from "@agentclientprotocol/sdk";
 import type { Config } from "./config.js";
-import { CHUNK_MAX } from "./config.js";
-import {
-  sleep,
-  formatAge,
-} from "./utils.js";
+import { formatAge, ageMs } from "./utils.js";
 import {
   reloadAccess,
   isAllowed,
@@ -26,21 +14,81 @@ import {
   getActivePrompt,
   getPendingPermission,
   getTypingStartedAt,
-  setTypingStartedAt,
   enqueuePrompt,
+  getLikelyState,
   type HealthSnapshotInput,
 } from "./state.js";
-import { sanitizedError, sanitizePermissionText } from "./redact.js";
+import { sanitizedError } from "./redact.js";
+import { cleanupInboxFiles, type InboxFile, type RootIdentity } from "./media.js";
 import {
-  downloadTelegramFileBytes,
-  guessMime,
-  isAllowedMime,
-  writeInboxFile,
-  cleanupInboxFiles,
-  type InboxFile,
-  type RootIdentity,
-} from "./media.js";
-import { basename } from "node:path";
+  setTelegramRuntime,
+  beginUpdate,
+  endUpdate,
+  getRuntimeConfig,
+  sendMessage,
+  answerCallbackQuery,
+  editPermissionMessage,
+  editMessageReplyMarkup,
+  setMessageReaction,
+  resetApiForTests,
+} from "./telegram-api.js";
+import {
+  permissionSelection,
+  permissionSelectionByKind,
+  finalizeExistingPermissionText,
+} from "./telegram-permissions.js";
+import { resetStreamDraftState } from "./telegram-stream.js";
+import { startTyping, stopTyping } from "./telegram-typing.js";
+import {
+  setBubbleActive,
+  setToolsSeenCount,
+  resetBubblesForTests,
+} from "./telegram-bubbles.js";
+import {
+  extractMediaFromMessage,
+  replyContextFromMessage,
+  messageHasMedia,
+} from "./telegram-media.js";
+
+export { escapeHtml, markdownToTelegramHtml, chunkMessage } from "./telegram-render.js";
+export {
+  permissionKeyboard,
+  stalePromptKeyboard,
+  permissionSelection,
+  permissionSelectionByKind,
+  pendingPermissionText,
+  resolvedPermissionText,
+  expiredPermissionText,
+  finalizeExistingPermissionText,
+} from "./telegram-permissions.js";
+export {
+  sendMessage,
+  sendFormattedMessage,
+  editFormattedMessage,
+  editMessageReplyMarkup,
+  editPermissionMessage,
+  stopPolling,
+  beginOutboundShutdown,
+  closeOutboundQueue,
+} from "./telegram-api.js";
+export {
+  resetStreamDraftState,
+  resetAndWaitForStreamDrafts,
+  finalizeStreamDrafts,
+  appendAssistantDelta,
+  scheduleAssistantDeltaFlush,
+  getCurrentAssistantText,
+  getStreamDrafts,
+} from "./telegram-stream.js";
+export { startTyping, stopTyping } from "./telegram-typing.js";
+export {
+  dismissBubble,
+  trackToolCall,
+  updateToolCall,
+  getToolsSeenCount,
+  describeTool,
+} from "./telegram-bubbles.js";
+
 export interface PromptPayload {
   text: string;
   replyContext: string | null;
@@ -77,991 +125,6 @@ export interface TelegramDeps {
   onUpdate?: () => void;
 }
 
-let telegramToken: string | null = null;
-let runtimeConfig: Config | null = null;
-interface QueueItem {
-  fn: () => Promise<unknown>;
-  resolve: (value: unknown) => void;
-  reject: (error: unknown) => void;
-  attempts: number;
-}
-let sendQueue: QueueItem[] = [];
-let sendQueueRunning = false;
-let sendQueueClosing = false;
-let sendQueueDrainPromise: Promise<void> | null = null;
-let inFlightUpdates = 0;
-let typingInterval: NodeJS.Timeout | null = null;
-let typingDebounceTimer: NodeJS.Timeout | null = null;
-let typingMaxTimer: NodeJS.Timeout | null = null;
-const streamDrafts = new Map<number, {
-  messageId: number | null;
-  text: string;
-  lastSentText: string;
-  lastEditAt: number;
-  timer: NodeJS.Timeout | null;
-  flushing: boolean;
-  generation: number;
-}>();
-let streamGeneration = 0;
-const streamFlushTasks = new Map<number, Set<Promise<void>>>();
-let currentAssistantText = "";
-let assistantTextTruncated = false;
-let bubbleActive = false;
-const bubbleMessageIds = new Map<number, number>();
-const allBubbleIds = new Map<number, Set<number>>();
-let bubbleDebounceTimer: NodeJS.Timeout | null = null;
-let flushInProgress = false;
-let reflushNeeded = false;
-let lastCompletedToolDesc: string | null = null;
-const activeTools = new Map<string, { name: string; description: string }>();
-let toolsSeenCount = 0;
-
-interface TelegramMessageResult {
-  message_id: number;
-}
-
-type SendMessageExtra = {
-  reply_markup?: InlineKeyboardMarkup;
-};
-
-interface TelegramApiEnvelope {
-  ok: boolean;
-  result?: unknown;
-  description?: string;
-  parameters?: { retry_after?: number };
-}
-
-const PERMISSION_LABELS: Record<PermissionOption["kind"], string> = {
-  allow_once: "✅ Allowed once",
-  allow_always: "✅ Allowed for session",
-  reject_once: "❌ Rejected once",
-  reject_always: "⛔ Always rejected",
-};
-
-const PERMISSION_BUTTON_LABELS: Record<PermissionOption["kind"], string> = {
-  allow_once: "✅ Allow once",
-  allow_always: "✅ Allow for session",
-  reject_once: "❌ Reject once",
-  reject_always: "⛔ Always reject",
-};
-
-export function permissionKeyboard(
-  id: string,
-  options: PermissionOption[],
-): InlineKeyboardMarkup {
-  const allows: InlineKeyboardMarkup["inline_keyboard"][number] = [];
-  const rejects: InlineKeyboardMarkup["inline_keyboard"][number] = [];
-  options.forEach((option, index) => {
-    const button = {
-      text: PERMISSION_BUTTON_LABELS[option.kind],
-      callback_data: `grok:o:${id}:${index}`,
-    };
-    if (option.kind.startsWith("allow_")) allows.push(button);
-    else rejects.push(button);
-  });
-  if (rejects.length === 0) {
-    rejects.push({ text: "❌ Reject", callback_data: `grok:c:${id}` });
-  }
-  return { inline_keyboard: [allows, rejects].filter((row) => row.length > 0) };
-}
-
-export function stalePromptKeyboard(promptId: string): InlineKeyboardMarkup {
-  return {
-    inline_keyboard: [[
-      { text: "Cancel", callback_data: `grok:s:${promptId}:cancel` },
-      { text: "Keep waiting", callback_data: `grok:s:${promptId}:keep` },
-    ]],
-  };
-}
-
-export function permissionSelection(
-  options: PermissionOption[],
-  index: number,
-): { decision: RequestPermissionResponse; label: string } | null {
-  const option = options[index];
-  if (!option) return null;
-  return {
-    decision: { outcome: { outcome: "selected", optionId: option.optionId } },
-    label: PERMISSION_LABELS[option.kind],
-  };
-}
-
-export function permissionSelectionByKind(
-  options: PermissionOption[],
-  kinds: PermissionOption["kind"][],
-): { decision: RequestPermissionResponse; label: string } | null {
-  const option = kinds
-    .map((kind) => options.find((candidate) => candidate.kind === kind))
-    .find((candidate): candidate is PermissionOption => candidate !== undefined);
-  if (!option) return null;
-  return {
-    decision: { outcome: { outcome: "selected", optionId: option.optionId } },
-    label: PERMISSION_LABELS[option.kind],
-  };
-}
-
-export function pendingPermissionText(summary: string): string {
-  return `⚠️ Grok Build needs approval\n\n${summary}\n\nChoose an option below or reply approve/reject.`;
-}
-
-export function resolvedPermissionText(summary: string, label: string): string {
-  return `${label}\n\n${summary}\n\nDecision recorded.`;
-}
-
-export function expiredPermissionText(summary: string): string {
-  return `⌛ Approval expired\n\n${summary}\n\nNo action was approved.`;
-}
-
-export function finalizeExistingPermissionText(text: string | undefined, label: string): string {
-  const summary = String(text || "Permission request")
-    .replace(/^⚠️ Grok Build needs approval\s*/u, "")
-    .replace(/\s*(?:Tap a button|Choose an option below).*$/su, "")
-    .trim() || "Permission request";
-  return label === "⌛ Approval expired"
-    ? expiredPermissionText(summary)
-    : resolvedPermissionText(summary, label);
-}
-
-class TelegramApiError extends Error {
-  constructor(
-    message: string,
-    readonly status: number,
-    readonly retryAfter?: number,
-  ) {
-    super(message);
-    this.name = "TelegramApiError";
-  }
-}
-
-export function escapeHtml(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
-
-export function markdownToTelegramHtml(md: string): string {
-  const holds: string[] = [];
-  function hold(html: string) {
-    const i = holds.length;
-    holds.push(html);
-    return `\x00${i}\x00`;
-  }
-  let t = md;
-
-  t = t.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
-    code = code.replace(/\n$/, "");
-    const cls = lang ? ` class="language-${lang}"` : "";
-    return hold(`<pre><code${cls}>${escapeHtml(code)}</code></pre>`);
-  });
-  t = t.replace(/`([^`\n]+)`/g, (_, code) => hold(`<code>${escapeHtml(code)}</code>`));
-  const renderLink = (text: string, url: string, image: boolean): string => {
-    const label = image ? `[${text || "image"}]` : text;
-    if (!isSafeLink(url)) return hold(`${escapeHtml(label)} (${escapeHtml(url)})`);
-    return hold(`<a href="${escapeHtml(url)}">${escapeHtml(label)}</a>`);
-  };
-  t = t.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (_, alt: string, url: string) =>
-    renderLink(alt, url, true));
-  t = t.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, text: string, url: string) =>
-    renderLink(text, url, false));
-
-  t = escapeHtml(t);
-
-  t = t.replace(/\*\*\*(.+?)\*\*\*/g, "<b><i>$1</i></b>");
-  t = t.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>");
-  t = t.replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g, "<i>$1</i>");
-  t = t.replace(/~~(.+?)~~/g, "<s>$1</s>");
-  t = t.replace(/^#{1,6}\s+(.+)$/gm, "<b>$1</b>");
-  t = t.replace(/(?:^&gt;[ ]?.*$\n?)+/gm, (block) => {
-    const lines = block.trimEnd().split("\n").map((l) => l.replace(/^&gt;[ ]?/, ""));
-    return `<blockquote>${lines.join("\n")}</blockquote>\n`;
-  });
-  t = t.replace(/^-{3,}$/gm, "\u2500".repeat(20));
-  t = t.replace(/\x00(\d+)\x00/g, (_, i) => holds[parseInt(i)] || "");
-  return t;
-}
-
-function isSafeLink(url: string): boolean {
-  try {
-    return ["http:", "https:", "tg:", "mailto:"].includes(new URL(url).protocol.toLowerCase());
-  } catch {
-    return false;
-  }
-}
-
-export function chunkMessage(text: string, maxLen = CHUNK_MAX): string[] {
-  const chunks: string[] = [];
-  let remaining = text;
-  while (remaining.length > maxLen) {
-    let splitAt = remaining.lastIndexOf("\n\n", maxLen);
-    if (splitAt <= 0) splitAt = remaining.lastIndexOf("\n", maxLen);
-    if (splitAt <= 0) splitAt = maxLen;
-    chunks.push(remaining.slice(0, splitAt));
-    remaining = remaining.slice(splitAt).replace(/^\n+/, "");
-  }
-  if (remaining.length > 0) chunks.push(remaining);
-  return chunks;
-}
-
-function getTelegramToken(): string {
-  if (!telegramToken) throw new Error("Telegram bot is not initialized");
-  return telegramToken;
-}
-
-function getRuntimeConfig(): Config {
-  if (!runtimeConfig) throw new Error("Telegram runtime is not configured");
-  return runtimeConfig;
-}
-
-function parseApiEnvelope(value: unknown): TelegramApiEnvelope {
-  if (!value || typeof value !== "object" || !("ok" in value) || typeof value.ok !== "boolean") {
-    throw new Error("Telegram API returned an invalid response");
-  }
-  const envelope: TelegramApiEnvelope = { ok: value.ok };
-  if ("result" in value) envelope.result = value.result;
-  if ("description" in value && typeof value.description === "string") {
-    envelope.description = value.description;
-  }
-  if ("parameters" in value && value.parameters && typeof value.parameters === "object") {
-    const retryAfter = "retry_after" in value.parameters
-      && typeof value.parameters.retry_after === "number"
-      ? value.parameters.retry_after
-      : undefined;
-    if (retryAfter !== undefined) envelope.parameters = { retry_after: retryAfter };
-  }
-  return envelope;
-}
-
-function requireMessageResult(value: unknown): TelegramMessageResult {
-  if (!value || typeof value !== "object" || !("message_id" in value)
-    || typeof value.message_id !== "number") {
-    throw new Error("Telegram API returned an invalid message");
-  }
-  return { message_id: value.message_id };
-}
-
-async function callApi(
-  method: string,
-  params: Record<string, unknown>,
-  token: string,
-): Promise<unknown> {
-  const url = `https://api.telegram.org/bot${token}/${method}`;
-  const timeoutMs = getRuntimeConfig().API_TIMEOUT_MS;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(params),
-    signal: AbortSignal.timeout(timeoutMs),
-  });
-  if (res.status === 409) {
-    throw new TelegramApiError("Conflict: another process is polling this bot", 409);
-  }
-  if (res.status === 429) {
-    let retryAfter = 5;
-    try {
-      const body = parseApiEnvelope(await res.json());
-      retryAfter = body.parameters?.retry_after ?? retryAfter;
-    } catch (error: unknown) {
-      console.warn(`[TG] Unable to parse rate-limit response: ${sanitizedError(error)}`);
-    }
-    throw new TelegramApiError("Rate limited", 429, retryAfter);
-  }
-  if (!res.ok) {
-    let description = "";
-    try {
-      description = sanitizedError(await res.text(), 300);
-    } catch (error: unknown) {
-      console.warn(`[TG] Unable to read API error response: ${sanitizedError(error)}`);
-    }
-    throw new TelegramApiError(
-      `Telegram API ${method} failed: ${res.status}${description ? ` ${description}` : ""}`,
-      res.status,
-    );
-  }
-  const json = parseApiEnvelope(await res.json());
-  if (!json.ok) {
-    throw new TelegramApiError(
-      `Telegram API ${method} returned ok=false: ${sanitizedError(json.description ?? "unknown")}`,
-      res.status === 200 ? 0 : res.status,
-    );
-  }
-  return json.result;
-}
-
-function enqueue(fn: () => Promise<unknown>): Promise<unknown> {
-  return new Promise((resolve, reject) => {
-    if (sendQueueClosing) {
-      reject(new Error("Telegram outbound queue is shutting down"));
-      return;
-    }
-    const config = getRuntimeConfig();
-    if (sendQueue.length + (sendQueueRunning ? 1 : 0) >= config.TELEGRAM_OUTBOUND_QUEUE_MAX) {
-      reject(new Error("Telegram outbound queue is full"));
-      return;
-    }
-    sendQueue.push({ fn, resolve, reject, attempts: 0 });
-    if (!sendQueueRunning) sendQueueDrainPromise = drainQueue();
-  });
-}
-async function drainQueue(): Promise<void> {
-  sendQueueRunning = true;
-  try {
-    while (sendQueue.length > 0) {
-      const item = sendQueue.shift();
-      if (!item) continue;
-      if (sendQueueClosing) {
-        item.reject(new Error("Telegram outbound queue is shutting down"));
-        continue;
-      }
-      try {
-        const r = await item.fn();
-        item.resolve(r);
-      } catch (err: unknown) {
-        const config = getRuntimeConfig();
-        if (err instanceof TelegramApiError && err.status === 429
-          && item.attempts < config.TELEGRAM_RETRY_MAX && !sendQueueClosing) {
-          item.attempts += 1;
-          sendQueue.unshift(item);
-          await sleep(Math.min((err.retryAfter ?? 5) * 1000, config.API_TIMEOUT_MS));
-          continue;
-        }
-        item.reject(err);
-      }
-      if (sendQueue.length > 0) await sleep(getRuntimeConfig().SEND_PACE_MS);
-    }
-  } finally {
-    sendQueueRunning = false;
-    sendQueueDrainPromise = null;
-  }
-}
-
-export async function sendMessage(
-  chatId: number,
-  text: string,
-  extra: SendMessageExtra = {},
-): Promise<TelegramMessageResult> {
-  const result = await enqueue(() =>
-    callApi("sendMessage", { chat_id: chatId, text, ...extra }, getTelegramToken()));
-  return requireMessageResult(result);
-}
-
-export async function sendFormattedMessage(
-  chatId: number,
-  markdown: string,
-): Promise<TelegramMessageResult> {
-  const html = markdownToTelegramHtml(markdown);
-  try {
-    const result = await enqueue(() =>
-      callApi("sendMessage", { chat_id: chatId, text: html, parse_mode: "HTML" }, getTelegramToken()));
-    return requireMessageResult(result);
-  } catch (err: unknown) {
-    if (err instanceof Error && /can.t parse|entit/i.test(err.message)) {
-      const result = await enqueue(() =>
-        callApi("sendMessage", { chat_id: chatId, text: markdown }, getTelegramToken()));
-      return requireMessageResult(result);
-    }
-    throw err;
-  }
-}
-
-export async function editFormattedMessage(
-  chatId: number,
-  messageId: number,
-  markdown: string,
-): Promise<void> {
-  const html = markdownToTelegramHtml(markdown);
-  try {
-    await enqueue(() =>
-      callApi(
-        "editMessageText",
-        { chat_id: chatId, message_id: messageId, text: html, parse_mode: "HTML" },
-        getTelegramToken(),
-      ),
-    );
-  } catch (err: unknown) {
-    if (err instanceof Error && /can.t parse|entit/i.test(err.message)) {
-      await enqueue(() =>
-        callApi(
-          "editMessageText",
-          { chat_id: chatId, message_id: messageId, text: markdown },
-          getTelegramToken(),
-        ),
-      );
-      return;
-    }
-    throw err;
-  }
-}
-
-export async function editMessageReplyMarkup(
-  chatId: number,
-  messageId: number,
-  replyMarkup: InlineKeyboardMarkup | null = null,
-): Promise<void> {
-  await enqueue(() => callApi("editMessageReplyMarkup", {
-    chat_id: chatId,
-    message_id: messageId,
-    reply_markup: replyMarkup ?? { inline_keyboard: [] },
-  }, getTelegramToken()));
-}
-
-export async function editPermissionMessage(
-  chatId: number,
-  messageId: number,
-  text: string,
-): Promise<void> {
-  await enqueue(() => callApi("editMessageText", {
-    chat_id: chatId,
-    message_id: messageId,
-    text,
-    reply_markup: { inline_keyboard: [] },
-  }, getTelegramToken()));
-}
-
-export async function answerCallbackQuery(
-  id: string,
-  text?: string,
-  showAlert = false,
-): Promise<void> {
-  await enqueue(() =>
-    callApi(
-      "answerCallbackQuery",
-      { callback_query_id: id, text: text || "", show_alert: showAlert },
-      getTelegramToken(),
-    ),
-  );
-}
-
-export async function setMessageReaction(
-  chatId: number,
-  messageId: number,
-  emoji: ReactionTypeEmoji["emoji"],
-): Promise<void> {
-  await enqueue(() =>
-    callApi(
-      "setMessageReaction",
-      { chat_id: chatId, message_id: messageId, reaction: [{ type: "emoji", emoji }] },
-      getTelegramToken(),
-    ),
-  );
-}
-
-export async function sendChatAction(chatId: number, action = "typing"): Promise<void> {
-  await enqueue(() =>
-    callApi("sendChatAction", { chat_id: chatId, action }, getTelegramToken()),
-  );
-}
-
-export async function deleteMessage(chatId: number, messageId: number): Promise<void> {
-  await enqueue(() =>
-    callApi("deleteMessage", { chat_id: chatId, message_id: messageId }, getTelegramToken()));
-}
-
-export function startTyping(chatIds: number[]): void {
-  stopTyping();
-  const config = getRuntimeConfig();
-  setTypingStartedAt(Date.now());
-  const doType = () => {
-    for (const id of chatIds) {
-      void sendChatAction(id).catch((error: unknown) => {
-        console.warn(`[TG] Typing action failed for chat ${id}: ${sanitizedError(error)}`);
-      });
-    }
-    if (bubbleActive) resetTypingDebounce();
-  };
-  doType();
-  typingInterval = setInterval(doType, config.TYPING_INTERVAL_MS);
-  typingInterval.unref();
-  typingMaxTimer = setTimeout(stopTyping, config.MAX_TYPING_SESSION_MS);
-  typingMaxTimer.unref();
-  resetTypingDebounce();
-}
-
-export function resetTypingDebounce(): void {
-  if (typingDebounceTimer) clearTimeout(typingDebounceTimer);
-  typingDebounceTimer = setTimeout(stopTyping, getRuntimeConfig().TYPING_DEBOUNCE_MS);
-  typingDebounceTimer.unref();
-}
-
-export function stopTyping() {
-  if (typingInterval) {
-    clearInterval(typingInterval);
-    typingInterval = null;
-  }
-  if (typingDebounceTimer) {
-    clearTimeout(typingDebounceTimer);
-    typingDebounceTimer = null;
-  }
-  if (typingMaxTimer) {
-    clearTimeout(typingMaxTimer);
-    typingMaxTimer = null;
-  }
-  setTypingStartedAt(null);
-}
-
-export function resetStreamDraftState() {
-  streamGeneration += 1;
-  currentAssistantText = "";
-  assistantTextTruncated = false;
-  for (const d of streamDrafts.values()) {
-    if (d.timer) clearTimeout(d.timer);
-  }
-  streamDrafts.clear();
-}
-
-export async function resetAndWaitForStreamDrafts(): Promise<void> {
-  resetStreamDraftState();
-  for (;;) {
-    const tasks = [...streamFlushTasks.values()].flatMap((set) => [...set]);
-    if (!tasks.length) return;
-    await Promise.all(tasks);
-  }
-}
-
-function trimDraftText(text: string, max: number): string {
-  if (text.length <= max) return text;
-  const tail = text.slice(-max + 80).replace(/^\S*\s*/, "");
-  return `…\n${tail}`;
-}
-
-function trackStreamFlush(
-  generation: number,
-  operation: Promise<void>,
-  label: string,
-): void {
-  let tasks = streamFlushTasks.get(generation);
-  if (!tasks) {
-    tasks = new Set();
-    streamFlushTasks.set(generation, tasks);
-  }
-  const tracked = operation
-    .catch((error: unknown) => {
-      console.error(`[TG] ${label}: ${sanitizedError(error)}`);
-    })
-    .finally(() => {
-      tasks?.delete(tracked);
-      if (tasks?.size === 0) streamFlushTasks.delete(generation);
-    });
-  tasks.add(tracked);
-}
-
-function scheduleStreamDraftFlush(chatIds: number[], force = false, config: Config): void {
-  const text = trimDraftText(currentAssistantText, config.STREAM_DRAFT_MAX);
-  if (!text) return;
-  for (const chatId of chatIds) {
-    let draft = streamDrafts.get(chatId);
-    if (!draft) {
-      draft = {
-        messageId: null,
-        text: "",
-        lastSentText: "",
-        lastEditAt: 0,
-        timer: null,
-        flushing: false,
-        generation: streamGeneration,
-      };
-      streamDrafts.set(chatId, draft);
-    }
-    draft.text = text;
-    if (!force && draft.lastSentText
-      && Math.abs(text.length - draft.lastSentText.length) < config.STREAM_MIN_DELTA_CHARS) {
-      continue;
-    }
-    if (draft.timer) continue;
-    const elapsed = Date.now() - draft.lastEditAt;
-    const delay = force ? 0 : Math.max(0, config.STREAM_EDIT_INTERVAL_MS - elapsed);
-    const generation = draft.generation;
-    draft.timer = setTimeout(() => {
-      trackStreamFlush(
-        generation,
-        flushStreamDraft(chatId, force, config, generation),
-        `Stream draft flush failed for chat ${chatId}`,
-      );
-    }, delay);
-  }
-}
-
-async function flushStreamDraft(
-  chatId: number,
-  force: boolean,
-  config: Config,
-  generation: number,
-): Promise<void> {
-  const draft = streamDrafts.get(chatId);
-  if (!draft || draft.generation !== generation || generation !== streamGeneration) return;
-  draft.timer = null;
-  if (draft.flushing) {
-    if (force) {
-      while (draft.flushing) await sleep(10);
-      return flushStreamDraft(chatId, true, config, generation);
-    }
-    draft.timer = setTimeout(() => {
-      trackStreamFlush(
-        generation,
-        flushStreamDraft(chatId, false, config, generation),
-        `Deferred stream flush failed for chat ${chatId}`,
-      );
-    }, config.STREAM_EDIT_INTERVAL_MS);
-    return;
-  }
-  if (!force && draft.lastSentText && draft.text === draft.lastSentText) return;
-
-  draft.flushing = true;
-  try {
-    const text = draft.text;
-    if (draft.messageId) {
-      try {
-        await editFormattedMessage(chatId, draft.messageId, text);
-      } catch (err: unknown) {
-        if (err instanceof Error && /message is not modified/i.test(err.message)) {
-          // ok
-        } else if (err instanceof Error && /message to edit not found/i.test(err.message)) {
-          const sent = await sendFormattedMessage(chatId, text);
-          draft.messageId = sent.message_id;
-        } else {
-          throw err;
-        }
-      }
-    } else {
-      const sent = await sendFormattedMessage(chatId, text);
-      draft.messageId = sent.message_id;
-    }
-    draft.lastSentText = text;
-    draft.lastEditAt = Date.now();
-  } finally {
-    draft.flushing = false;
-    if (draft.text !== draft.lastSentText && streamDrafts.get(chatId) === draft) {
-      draft.timer = setTimeout(() => {
-        trackStreamFlush(
-          generation,
-          flushStreamDraft(chatId, false, config, generation),
-          `Follow-up stream flush failed for chat ${chatId}`,
-        );
-      }, config.STREAM_EDIT_INTERVAL_MS);
-    }
-  }
-}
-
-export async function finalizeStreamDrafts(
-  finalContent: string,
-  chatIds: number[],
-  config: Config,
-): Promise<void> {
-  const chunks = chunkMessage(finalContent);
-  const finalFirst = chunks[0] ?? finalContent;
-  currentAssistantText = finalFirst;
-  for (const chatId of chatIds) {
-    const draft = streamDrafts.get(chatId) ?? {
-      messageId: null,
-      text: "",
-      lastSentText: "",
-      lastEditAt: 0,
-      timer: null,
-      flushing: false,
-      generation: streamGeneration,
-    };
-    draft.text = finalFirst;
-    streamDrafts.set(chatId, draft);
-  }
-  try {
-    await Promise.all(chatIds.map(async (chatId) => {
-      const draft = streamDrafts.get(chatId);
-      if (!draft) throw new Error(`Missing stream draft for chat ${chatId}`);
-      if (draft.timer) {
-        clearTimeout(draft.timer);
-        draft.timer = null;
-      }
-      await flushStreamDraft(chatId, true, config, draft.generation);
-      for (const chunk of chunks.slice(1)) {
-        await sendFormattedMessage(chatId, chunk);
-      }
-    }));
-  } catch (error: unknown) {
-    console.error(`[TG] Final response delivery failed: ${sanitizedError(error)}`);
-    throw error;
-  } finally {
-    resetStreamDraftState();
-  }
-}
-
-function getStringProperty(value: unknown, property: string): string | null {
-  if (!isUnknownRecord(value)) return null;
-  const candidate = value[property];
-  return typeof candidate === "string" ? candidate : null;
-}
-
-function isUnknownRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object";
-}
-
-export function describeTool(title: string | null | undefined, rawInput: unknown): string | null {
-  if (!title) return null;
-  if (typeof rawInput === "string") {
-    return sanitizePermissionText(rawInput.split("\n")[0] ?? "", 120);
-  }
-  const command = getStringProperty(rawInput, "command");
-  if (command) return sanitizePermissionText(command.split("\n")[0] ?? "", 120);
-  const path = getStringProperty(rawInput, "path");
-  if (path) return sanitizePermissionText(`${title} ${path}`, 120);
-  return sanitizePermissionText(title, 120);
-}
-
-function scheduleBubbleUpdate(): void {
-  if (!bubbleActive) return;
-  if (bubbleDebounceTimer) clearTimeout(bubbleDebounceTimer);
-  const debounce = getRuntimeConfig().BUBBLE_DEBOUNCE_MS;
-  bubbleDebounceTimer = setTimeout(() => {
-    void flushBubble().catch((error: unknown) => {
-      console.error(`[TG] Tool progress bubble failed: ${sanitizedError(error)}`);
-    });
-  }, debounce);
-}
-
-function rememberBubbleMessage(chatId: number, messageId: number): void {
-  bubbleMessageIds.set(chatId, messageId);
-  const ids = allBubbleIds.get(chatId) ?? new Set<number>();
-  ids.add(messageId);
-  allBubbleIds.set(chatId, ids);
-}
-
-function getAuthorizedActiveChat(): number | null {
-  const active = getActivePrompt();
-  const config = runtimeConfig;
-  if (!active || !config) return null;
-  const access = reloadAccess(config);
-  return isAllowed(access, active.userId) ? active.chatId : null;
-}
-
-async function flushBubble(): Promise<void> {
-  bubbleDebounceTimer = null;
-  if (!bubbleActive) return;
-  if (flushInProgress) {
-    reflushNeeded = true;
-    return;
-  }
-  flushInProgress = true;
-  try {
-    const chatId = getAuthorizedActiveChat();
-    if (chatId == null) return;
-    const lines = [...activeTools.values()]
-      .map((info) => info.description)
-      .filter((description) => description.length > 0)
-      .map((description) => `● ${description}`);
-    const text = lines.length > 0
-      ? lines.join("\n")
-      : lastCompletedToolDesc
-        ? `● ${lastCompletedToolDesc}`
-        : null;
-    if (!text || !bubbleActive) return;
-
-    const currentMessageId = bubbleMessageIds.get(chatId);
-    if (currentMessageId) {
-      try {
-        await editFormattedMessage(chatId, currentMessageId, text);
-        return;
-      } catch (error: unknown) {
-        if (!(error instanceof Error && /message to edit not found/i.test(error.message))) {
-          throw error;
-        }
-        bubbleMessageIds.delete(chatId);
-      }
-    }
-    const sent = await sendFormattedMessage(chatId, text);
-    rememberBubbleMessage(chatId, sent.message_id);
-  } finally {
-    flushInProgress = false;
-    if (reflushNeeded) {
-      reflushNeeded = false;
-      scheduleBubbleUpdate();
-    }
-  }
-}
-
-export async function dismissBubble(): Promise<void> {
-  bubbleActive = false;
-  if (bubbleDebounceTimer) {
-    clearTimeout(bubbleDebounceTimer);
-    bubbleDebounceTimer = null;
-  }
-  activeTools.clear();
-  lastCompletedToolDesc = null;
-  while (flushInProgress) await sleep(10);
-  for (const [chatId, ids] of allBubbleIds) {
-    for (const mid of ids) {
-      try {
-        await deleteMessage(chatId, mid);
-      } catch (error: unknown) {
-        console.warn(`[TG] Failed to delete tool bubble ${mid} in chat ${chatId}: ${sanitizedError(error)}`);
-      }
-    }
-    ids.clear();
-  }
-  allBubbleIds.clear();
-  bubbleMessageIds.clear();
-}
-
-export function trackToolCall(
-  toolCallId: string,
-  title: string | null,
-  rawInput: unknown,
-): void {
-  if (getAuthorizedActiveChat() == null) return;
-  toolsSeenCount += 1;
-  const desc = describeTool(title, rawInput);
-  if (desc) {
-    activeTools.set(toolCallId, { name: title || "tool", description: desc });
-    bubbleActive = true;
-    scheduleBubbleUpdate();
-  }
-}
-
-export function updateToolCall(toolCallId: string, status?: ToolCallStatus | null): void {
-  const t = activeTools.get(toolCallId);
-  if (t && (status === "completed" || status === "failed")) {
-    lastCompletedToolDesc = t.description;
-    activeTools.delete(toolCallId);
-    scheduleBubbleUpdate();
-  }
-}
-
-export function getToolsSeenCount(): number {
-  return toolsSeenCount;
-}
-
-async function getFilePath(fileId: string): Promise<string> {
-  const result = await enqueue(() =>
-    callApi("getFile", { file_id: fileId }, getTelegramToken()));
-  if (!result || typeof result !== "object" || !("file_path" in result)) {
-    throw new Error("Telegram getFile returned no file_path");
-  }
-  const path = (result as { file_path?: string }).file_path;
-  if (!path) throw new Error("Telegram getFile returned empty file_path");
-  return path;
-}
-
-async function downloadAttachment(
-  config: Config,
-  root: RootIdentity,
-  fileId: string,
-  originalName: string,
-  telegramMime?: string | null,
-  telegramSize?: number,
-): Promise<InboxFile> {
-  const name = originalName || "attachment";
-  const mime = guessMime(name, telegramMime);
-  if (!isAllowedMime(mime, config.mimeAllowlist)) {
-    throw new Error(`MIME type not allowed: ${mime}`);
-  }
-  if (telegramSize != null && telegramSize > config.MEDIA_MAX_BYTES) {
-    throw new Error(`File too large (${telegramSize} bytes; max ${config.MEDIA_MAX_BYTES})`);
-  }
-  const remotePath = await getFilePath(fileId);
-  const bytes = await downloadTelegramFileBytes(
-    getTelegramToken(),
-    remotePath,
-    config.MEDIA_MAX_BYTES,
-    config.API_TIMEOUT_MS,
-  );
-  const file = writeInboxFile(root, name || basename(remotePath), bytes);
-  file.mime = mime;
-  return file;
-}
-
-interface MediaExtraction {
-  files: InboxFile[];
-  errors: string[];
-}
-
-async function extractMediaFromMessage(
-  config: Config,
-  message: Message,
-  root: RootIdentity,
-): Promise<MediaExtraction> {
-  const files: InboxFile[] = [];
-  const errors: string[] = [];
-
-  try {
-    if (message.photo && Array.isArray(message.photo) && message.photo.length > 0) {
-      const largest = message.photo[message.photo.length - 1];
-      if (largest?.file_id) {
-        files.push(await downloadAttachment(
-          config,
-          root,
-          largest.file_id,
-          "photo.jpg",
-          "image/jpeg",
-          largest.file_size,
-        ));
-      }
-    }
-    if (message.document?.file_id) {
-      const doc = message.document;
-      files.push(await downloadAttachment(
-        config,
-        root,
-        doc.file_id,
-        doc.file_name || "document",
-        doc.mime_type,
-        doc.file_size,
-      ));
-    }
-    if (message.voice?.file_id) {
-      files.push(await downloadAttachment(
-        config,
-        root,
-        message.voice.file_id,
-        "voice.ogg",
-        message.voice.mime_type || "audio/ogg",
-        message.voice.file_size,
-      ));
-    }
-    if (message.audio?.file_id) {
-      files.push(await downloadAttachment(
-        config,
-        root,
-        message.audio.file_id,
-        message.audio.file_name || "audio",
-        message.audio.mime_type,
-        message.audio.file_size,
-      ));
-    }
-    if (message.video?.file_id) {
-      files.push(await downloadAttachment(
-        config,
-        root,
-        message.video.file_id,
-        message.video.file_name || "video.mp4",
-        message.video.mime_type || "video/mp4",
-        message.video.file_size,
-      ));
-    }
-  } catch (error: unknown) {
-    errors.push(sanitizedError(error));
-  }
-
-  return { files, errors };
-}
-
-function replyContextFromMessage(
-  message: Message,
-): string | null {
-  const reply = message.reply_to_message;
-  if (!reply) return null;
-  const parts: string[] = [];
-  if (reply.text) parts.push(reply.text);
-  if (reply.caption) parts.push(reply.caption);
-  if (reply.photo) parts.push("[photo]");
-  if (reply.document) parts.push(`[document: ${reply.document.file_name || "file"}]`);
-  return parts.join("\n").slice(0, 2000) || null;
-}
-
-function messageHasMedia(message: Message): boolean {
-  return Boolean(
-    message.photo?.length
-      || message.document
-      || message.voice
-      || message.audio
-      || message.video,
-  );
-}
-
 function requireAuthorizedPrivate(
   ctx: Context,
   config: Config,
@@ -1075,17 +138,15 @@ function requireAuthorizedPrivate(
 }
 
 export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
-  telegramToken = config.TELEGRAM_BOT_TOKEN;
-  runtimeConfig = config;
-  sendQueueClosing = false;
-  const bot = new Bot(telegramToken);
+  setTelegramRuntime(config.TELEGRAM_BOT_TOKEN, config);
+  const bot = new Bot(config.TELEGRAM_BOT_TOKEN);
   bot.use(async (_ctx, next) => {
-    inFlightUpdates += 1;
+    beginUpdate();
     try {
       deps.onUpdate?.();
       await next();
     } finally {
-      inFlightUpdates -= 1;
+      endUpdate();
     }
   });
 
@@ -1510,10 +571,10 @@ export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
         console.warn(`[TG] Failed to acknowledge prompt: ${sanitizedError(error)}`);
       });
     }
-    toolsSeenCount = 0;
+    setToolsSeenCount(0);
     resetStreamDraftState();
     startTyping([chatId]);
-    bubbleActive = true;
+    setBubbleActive(true);
     const activePrompt = startActivePrompt(
       chatId,
       message.message_id || 0,
@@ -1545,64 +606,15 @@ export function createTelegramBot(config: Config, deps: TelegramDeps): Bot {
   return bot;
 }
 
-export async function stopPolling(bot: Bot): Promise<void> {
-  let stopError: unknown = null;
-  let stopTimer: NodeJS.Timeout | null = null;
-  try {
-    const stopResult = await Promise.race([
-      bot.stop().then(() => true),
-      new Promise<boolean>((resolve) => {
-        stopTimer = setTimeout(() => resolve(false), getRuntimeConfig().API_TIMEOUT_MS);
-        stopTimer.unref();
-      }),
-    ]);
-    if (!stopResult) throw new Error("Telegram polling stop timed out");
-  } catch (error: unknown) {
-    stopError = error;
-    console.warn(`[TG] Failed to stop polling cleanly: ${sanitizedError(error)}`);
-  } finally {
-    if (stopTimer) clearTimeout(stopTimer);
-  }
-  const deadline = Date.now() + getRuntimeConfig().API_TIMEOUT_MS;
-  while (inFlightUpdates > 0 && Date.now() < deadline) await sleep(25);
-  if (inFlightUpdates > 0) {
-    const handlerError = new Error(`Telegram handlers did not settle (${inFlightUpdates} still active)`);
-    throw stopError
-      ? new AggregateError([stopError, handlerError], "Telegram polling did not stop safely")
-      : handlerError;
-  }
-  if (stopError) throw stopError;
-}
-
-export function beginOutboundShutdown(): void {
-  sendQueueClosing = true;
-  const queued = sendQueue.splice(0);
-  for (const item of queued) item.reject(new Error("Telegram outbound queue is shutting down"));
-}
-
-export async function closeOutboundQueue(): Promise<void> {
-  beginOutboundShutdown();
-  const drain = sendQueueDrainPromise;
-  if (!drain) return;
-  const drained = await Promise.race([
-    drain.then(() => true),
-    sleep(getRuntimeConfig().API_TIMEOUT_MS + 1_000).then(() => false),
-  ]);
-  if (!drained) throw new Error("Telegram outbound queue did not drain during shutdown");
-}
-
 export function healthStatusLines(extra: HealthSnapshotInput): string[] {
   const ap = getActivePrompt();
   const pp = getPendingPermission();
   const typingStartedAt = getTypingStartedAt();
   const typingAgeMs = typingStartedAt == null ? null : Date.now() - typingStartedAt;
-  const likelyState = !extra.connected
-    ? "disconnected"
-    : pp
-      ? "waiting-permission"
-      : ap
-        ? "working"
-        : "idle";
+  const activityAgeMs = ap ? ageMs(ap.lastActivityAt ?? ap.startedAt) : null;
+  const promptStale = activityAgeMs != null
+    && activityAgeMs > getRuntimeConfig().PROMPT_STALE_AFTER_MS;
+  const likelyState = getLikelyState(!!extra.connected, !!pp, promptStale, !!ap);
   const lines = [
     "",
     "Health:",
@@ -1619,51 +631,13 @@ export function healthStatusLines(extra: HealthSnapshotInput): string[] {
   return lines;
 }
 
-export function getCurrentAssistantText() {
-  return currentAssistantText;
-}
-export function appendAssistantDelta(delta: string) {
-  if (assistantTextTruncated) return;
-  const max = getRuntimeConfig().ASSISTANT_TEXT_MAX_CHARS;
-  if (currentAssistantText.length + delta.length <= max) {
-    currentAssistantText += delta;
-    return;
-  }
-  const marker = "\n\n[Response truncated by bridge]";
-  const suffix = marker.slice(0, max);
-  const prefixBudget = Math.max(0, max - suffix.length);
-  currentAssistantText = (currentAssistantText + delta).slice(0, prefixBudget) + suffix;
-  assistantTextTruncated = true;
-}
-export function scheduleAssistantDeltaFlush(chatIds: number[], config: Config) {
-  scheduleStreamDraftFlush(chatIds, false, config);
-}
-
-export function getStreamDrafts() {
-  return streamDrafts;
-}
-
-export function resetTelegramRuntimeForTests() {
+export function resetTelegramRuntimeForTests(): void {
   stopTyping();
   resetStreamDraftState();
-  for (const item of sendQueue) item.reject(new Error("Telegram test runtime reset"));
-  sendQueue = [];
-  sendQueueRunning = false;
-  sendQueueClosing = false;
-  sendQueueDrainPromise = null;
-  inFlightUpdates = 0;
-  telegramToken = null;
-  runtimeConfig = null;
-  bubbleActive = false;
-  bubbleMessageIds.clear();
-  allBubbleIds.clear();
-  activeTools.clear();
-  lastCompletedToolDesc = null;
-  toolsSeenCount = 0;
+  resetBubblesForTests();
+  resetApiForTests();
 }
 
 export function setTelegramRuntimeForTests(token: string, config: Config): void {
-  telegramToken = token;
-  runtimeConfig = config;
-  sendQueueClosing = false;
+  setTelegramRuntime(token, config);
 }

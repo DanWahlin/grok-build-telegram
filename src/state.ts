@@ -723,7 +723,7 @@ export function buildHealthSnapshot(
   return snapshot;
 }
 
-function getLikelyState(
+export function getLikelyState(
   connected: boolean,
   pendingPerm: boolean,
   promptStale: boolean,

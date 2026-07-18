@@ -12,7 +12,17 @@ This project is a security-sensitive bridge between one private Telegram owner a
 | --- | --- |
 | `src/index.ts` | Process entry point and signal handling |
 | `src/bridge.ts` | Telegram-to-ACP orchestration and lifecycle |
-| `src/telegram.ts` | Telegram handlers, rendering, outbound queue, streaming, and tool bubbles |
+| `src/bridge-permissions.ts` | Permission-card send/resolve/expire/cancel lifecycle |
+| `src/bridge-ui.ts` | Plan, thought-stream, and stale-prompt-card rendering |
+| `src/bridge-watchdog.ts` | Stale-prompt detection and progress notices |
+| `src/telegram.ts` | Bot command/message/callback handlers and the telegram module facade |
+| `src/telegram-api.ts` | Runtime token/config, HTTP transport, and the paced outbound queue |
+| `src/telegram-render.ts` | Markdown-to-HTML rendering, HTML escaping, link safety, and chunking |
+| `src/telegram-permissions.ts` | Permission keyboards, selections, and card text |
+| `src/telegram-typing.ts` | Typing-indicator lifecycle |
+| `src/telegram-stream.ts` | Assistant streaming drafts and final delivery |
+| `src/telegram-bubbles.ts` | Tool-progress bubble rendering |
+| `src/telegram-media.ts` | Inbound Telegram attachment download and extraction |
 | `src/acp-client.ts` | Grok subprocess and ACP session/permission client |
 | `src/state.ts` | Pairing, authorization, locks, runtime state, and health snapshots |
 | `src/config.ts` | Environment parsing and runtime configuration |
