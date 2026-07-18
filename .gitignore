@@ -7,8 +7,16 @@ dist/
 
 # Environment and secrets
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
+!.env.*.example
+.npmrc
+*.pem
+*.key
+*.pfx
+*.p12
+credentials.*
+secrets.*
 
 # Runtime state (never commit)
 .grok-telegram-state/
@@ -17,6 +25,10 @@ access.json
 lock.json
 health.json
 *.json.tmp
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
 
 # Logs and temp
 *.log

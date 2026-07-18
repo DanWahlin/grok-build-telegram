@@ -16,17 +16,20 @@ This project is a security-sensitive bridge between one private Telegram owner a
 | `src/acp-client.ts` | Grok subprocess and ACP session/permission client |
 | `src/state.ts` | Pairing, authorization, locks, runtime state, and health snapshots |
 | `src/config.ts` | Environment parsing and runtime configuration |
+| `src/path-safety.ts` | Canonical path guards that keep runtime state and workspaces outside disposable build output |
 | `src/redact.ts` | Sanitization for logs and permission text |
 | `src/utils.ts` | Small shared time and random-value helpers |
 | `src/media.ts` | Attachment MIME/root helpers, inbox files, and ACP content blocks |
 | `src/*.test.ts` | Unit, integration, runtime, and security regression tests |
+| `scripts/clean.ts` | Guarded build cleanup that refuses runtime-path overlap |
 | `scripts/smoke-acp.ts` | Live ACP smoke test without Telegram |
 
 ## Non-negotiable invariants
 
 - Accept prompts, commands, callbacks, and permission decisions only from the paired owner in a private chat.
 - Keep permission decisions bound to the pending request, active user, and active chat.
-- Never pass `TELEGRAM_BOT_TOKEN` or unrelated parent-process secrets to the Grok subprocess.
+- Never pass `TELEGRAM_BOT_TOKEN` or unrelated parent-process secrets to the Grok subprocess. Environment filtering is not an OS sandbox; do not claim it prevents the child from reading files available to the same operating-system identity.
+- Never let build-cleaning commands remove runtime state, pairing identity, health files, or the active poller lock.
 - Launch subprocesses with `shell: false`; do not construct shell command strings from user input.
 - Preserve atomic state writes, state-directory symlink refusal, `0700` directory mode, and `0600` file mode.
 - Preserve the one-poller ownership lock and verify ownership before refreshing or removing it.
@@ -45,7 +48,7 @@ This project is a security-sensitive bridge between one private Telegram owner a
 Install dependencies with:
 
 ```bash
-npm install
+npm ci
 ```
 
 Before considering a change complete, run:

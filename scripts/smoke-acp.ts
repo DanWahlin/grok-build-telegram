@@ -1,11 +1,23 @@
 import { spawn } from "node:child_process";
+import { resolve } from "node:path";
 import { Readable, Writable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk";
+import { buildGrokChildEnv } from "../src/acp-client.js";
+import { resolveGrokBinary } from "../src/config.js";
 
-const grok = process.env["GROK_BIN"] || "/root/.grok/bin/grok";
-const child = spawn(grok, ["agent", "--model", "grok-4.5", "--always-approve", "stdio"], {
-  cwd: "/tmp",
+const grok = resolveGrokBinary(process.env["GROK_BIN"] ?? "grok", process.env["HOME"]);
+const model = process.env["GROK_MODEL"] ?? "grok-4.5";
+const sessionCwd = resolve(process.env["GROK_CWD"] ?? "/tmp");
+const alwaysApprove = ["true", "1", "yes"].includes(
+  (process.env["GROK_ALWAYS_APPROVE"] ?? "false").toLowerCase(),
+);
+const args = ["agent", "--model", model];
+if (alwaysApprove) args.push("--always-approve");
+args.push("stdio");
+const child = spawn(grok, args, {
+  cwd: sessionCwd,
   stdio: ["pipe", "pipe", "inherit"],
+  env: buildGrokChildEnv(process.env),
   shell: false,
 });
 const timeout = setTimeout(() => {
@@ -36,7 +48,7 @@ try {
       clientInfo: { name: "grok-build-telegram-smoke", version: "0.1.0" },
     });
     if (init.protocolVersion !== acp.PROTOCOL_VERSION) throw new Error("ACP protocol mismatch");
-    const session = await context.buildSession("/tmp").start();
+    const session = await context.buildSession(sessionCwd).start();
     const completion = session.prompt("Reply with exactly ACP_PONG. Do not use tools.");
     for (;;) {
       const message = await session.nextUpdate();

@@ -24,6 +24,8 @@ import {
   type AccessState,
 } from "./state.js";
 import { buildGrokChildEnv } from "./acp-client.js";
+import { parseEnvironment, resolveGrokBinary } from "./config.js";
+import { assertRuntimePathsOutsideBuildOutput } from "./path-safety.js";
 import {
   buildPromptBlocks,
   formatPlanText,
@@ -469,5 +471,83 @@ describe("prompt queue and stale keyboard", () => {
         { text: "Keep waiting", callback_data: "grok:s:prompt-1:keep" },
       ]],
     });
+  });
+});
+
+describe("public repository safety defaults", () => {
+  const baseEnv = {
+    TELEGRAM_BOT_TOKEN: "123456789:test-token-not-real",
+    GROK_CWD: process.cwd(),
+  };
+
+  it("caps shutdown-related configuration at the supported safety budget", () => {
+    expect(() => parseEnvironment({ ...baseEnv, API_TIMEOUT_MS: "30001" })).toThrow();
+    expect(() => parseEnvironment({ ...baseEnv, CANCEL_WAIT_MS: "30001" })).toThrow();
+    expect(() => parseEnvironment({ ...baseEnv, TELEGRAM_RETRY_MAX: "6" })).toThrow();
+    expect(parseEnvironment({
+      ...baseEnv,
+      API_TIMEOUT_MS: "30000",
+      CANCEL_WAIT_MS: "30000",
+      TELEGRAM_RETRY_MAX: "5",
+    })).toMatchObject({
+      API_TIMEOUT_MS: 30_000,
+      CANCEL_WAIT_MS: 30_000,
+      TELEGRAM_RETRY_MAX: 5,
+    });
+  });
+
+  it("resolves Grok from the current user's home without a root-specific path", () => {
+    const checked: string[] = [];
+    const resolved = resolveGrokBinary("grok", "/home/example", (candidate) => {
+      checked.push(candidate);
+      return candidate === "/home/example/.grok/bin/grok";
+    });
+    expect(resolved).toBe("/home/example/.grok/bin/grok");
+    expect(checked).not.toContain("/root/.grok/bin/grok");
+  });
+
+  it("rejects runtime state or agent workspaces inside build output", () => {
+    const root = mkdtempSync(join(tmpdir(), "grok-clean-guard-"));
+    const buildOutput = join(root, "dist");
+    const safeState = join(root, "state");
+    const safeCwd = join(root, "workspace");
+    mkdirSync(buildOutput);
+    mkdirSync(safeState);
+    mkdirSync(safeCwd);
+    const buildAlias = join(root, "build-alias");
+    symlinkSync(buildOutput, buildAlias);
+    try {
+      expect(() => assertRuntimePathsOutsideBuildOutput(
+        join(buildOutput, "state"),
+        safeCwd,
+        buildOutput,
+      )).toThrow(/STATE_DIR/);
+      expect(() => assertRuntimePathsOutsideBuildOutput(
+        safeState,
+        join(buildOutput, "workspace"),
+        buildOutput,
+      )).toThrow(/GROK_CWD/);
+      expect(() => assertRuntimePathsOutsideBuildOutput(
+        join(buildAlias, "state"),
+        safeCwd,
+        buildOutput,
+      )).toThrow(/STATE_DIR/);
+      expect(() => assertRuntimePathsOutsideBuildOutput(
+        safeState,
+        safeCwd,
+        buildOutput,
+      )).not.toThrow();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps package cleanup away from runtime identity and state", () => {
+    const packageJson = JSON.parse(
+      readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+    ) as { private?: boolean; scripts?: { clean?: string } };
+    expect(packageJson.private).toBe(true);
+    expect(packageJson.scripts?.clean).toBe("tsx scripts/clean.ts");
+    expect(packageJson.scripts?.clean).not.toMatch(/state|access\.json|lock\.json|health\.json/i);
   });
 });

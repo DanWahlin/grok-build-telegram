@@ -15,7 +15,7 @@ Run an xAI Grok Build coding-agent session from a private Telegram chat. The bri
 - **Streaming responses**: throttled draft edits, ordered multi-message final responses, typing indicators, tool-progress bubbles, progress notices, plan cards, optional thought stream (`/verbose`), and stall recovery buttons.
 - **Single-poller protection**: a PID, hostname, process-start token, and heartbeat lock prevent competing bridge instances.
 - **Operational visibility**: `/status` and `health.json` report session, prompt, permission, queue, cwd, usage, and tool activity.
-- **Secret isolation**: the Telegram token is not passed to the Grok subprocess, and sensitive values are redacted from permission summaries and logs.
+- **Child environment minimization**: the Telegram token is omitted from the Grok subprocess environment, and sensitive values are redacted from permission summaries and logs. This is not an OS sandbox; see [Security model and limitations](#security-model-and-limitations).
 
 ## Requirements
 
@@ -31,7 +31,7 @@ Run an xAI Grok Build coding-agent session from a private Telegram chat. The bri
    ```bash
    git clone https://github.com/DanWahlin/grok-build-telegram.git
    cd grok-build-telegram
-   npm install
+   npm ci
    cp .env.example .env
    ```
 
@@ -42,7 +42,7 @@ Run an xAI Grok Build coding-agent session from a private Telegram chat. The bri
    GROK_CWD=/absolute/path/to/the/project
    ```
 
-   `GROK_CWD` is the directory the Grok agent can inspect and modify. Use the narrowest practical project directory.
+   `GROK_CWD` is the directory the Grok agent can inspect and modify. Use the narrowest practical project directory. Do not point it at the bridge installation or any directory containing `.env`, credentials, private keys, or unrelated repositories.
 
 3. Start the bridge in development mode:
 
@@ -99,9 +99,10 @@ Copy `.env.example` to `.env`. Primary settings:
 | `MEDIA_MIME_ALLOWLIST` | images/audio/video/pdf/text… | Comma-separated MIME allowlist |
 | `PROMPT_QUEUE_MAX` | `3` | Follow-up queue depth while busy (`0` = reject) |
 | `TELEGRAM_OUTBOUND_QUEUE_MAX` | `100` | Maximum queued Telegram API operations |
-| `TELEGRAM_RETRY_MAX` | `5` | Maximum retries for a rate-limited Telegram operation |
+| `TELEGRAM_RETRY_MAX` | `5` | Rate-limit retries per Telegram operation (`0`–`5`) |
+| `API_TIMEOUT_MS` | `30000` | Per-operation API and ACP setup timeout (maximum `30000`) |
 | `ASSISTANT_TEXT_MAX_CHARS` | `200000` | Maximum assistant text retained for one response |
-| `CANCEL_WAIT_MS` | `15000` | Wait for ACP idle after cancel |
+| `CANCEL_WAIT_MS` | `15000` | Wait for ACP idle after cancel (maximum `30000`) |
 | `RETRY_LAST_TTL_MS` | `1800000` | How long `/retry last` keeps the last response |
 | `PROGRESS_NOTICE_AFTER_MS` | `90000` | First “still working” notice (mobile-friendly default) |
 | `VERBOSE_DEFAULT` | `false` | Start with thought stream enabled |
@@ -151,7 +152,8 @@ Inbox files for media live under `<session CWD>/.tg-inbox/` (not `STATE_DIR`). T
 - The first successfully paired Telegram user becomes the only owner. Pairing closes after that.
 - Commands, prompts, callbacks, and permission decisions are accepted only from the owner in a private chat.
 - Pairing codes expire and allow at most five attempts.
-- The Grok subprocess receives an explicit environment allowlist and never receives `TELEGRAM_BOT_TOKEN`.
+- The Grok subprocess receives an explicit environment allowlist and does not inherit `TELEGRAM_BOT_TOKEN`.
+- Environment filtering is not a sandbox. A Grok process running as the same operating-system user may read any file that user can access, including bridge configuration if filesystem permissions allow it. Keep the bridge installation and secrets outside `GROK_CWD`; use a separate execution identity or sandbox when the agent must not share that trust boundary.
 - ACP permission decisions are bound to the active request, owner, and chat.
 - `GROK_ALWAYS_APPROVE=true` removes the interactive safety boundary. Leave it disabled unless the agent and working directory are fully trusted.
 - Media ingress enforces MIME allowlists and size caps. Automatic outbound local-file delivery is disabled until ACP exposes a narrow artifact contract.
@@ -205,6 +207,8 @@ npm run build
 npm audit
 ```
 
+`npm run clean` removes only generated `dist` output. It refuses to run when `STATE_DIR` or `GROK_CWD` resolves inside `dist`, including through a symlink, so cleanup cannot erase runtime identity or an active media workspace.
+
 Run the live ACP-only smoke test when a working Grok CLI is available:
 
 ```bash
@@ -212,6 +216,10 @@ npm run smoke
 ```
 
 See [`AGENTS.md`](AGENTS.md) for repository structure, security invariants, testing guidance, and contributor expectations.
+
+## Reporting security issues
+
+Use the repository's private **Report a vulnerability** flow as described in [`SECURITY.md`](SECURITY.md). Do not disclose suspected vulnerabilities, tokens, private prompts, or runtime state in a public issue.
 
 ## License
 
