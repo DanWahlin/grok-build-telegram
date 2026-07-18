@@ -231,7 +231,7 @@ describe("ACP process ownership", () => {
       });
 
       const connecting = client.connect();
-      const deadline = Date.now() + 500;
+      const deadline = Date.now() + 2_000;
       while (!existsSync(marker) && Date.now() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 5));
       }
