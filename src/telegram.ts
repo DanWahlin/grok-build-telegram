@@ -31,7 +31,7 @@ import {
   getSessionCwd,
   type HealthSnapshotInput,
 } from "./state.js";
-import { sanitizedError } from "./redact.js";
+import { sanitizedError, sanitizePermissionText } from "./redact.js";
 import {
   downloadTelegramFileBytes,
   guessMime,
@@ -42,8 +42,6 @@ import {
   type InboxFile,
 } from "./media.js";
 import { basename } from "node:path";
-
-
 export interface PromptPayload {
   text: string;
   replyContext: string | null;
@@ -782,14 +780,16 @@ function isUnknownRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object";
 }
 
-function describeTool(title: string | null | undefined, rawInput: unknown): string | null {
+export function describeTool(title: string | null | undefined, rawInput: unknown): string | null {
   if (!title) return null;
-  if (typeof rawInput === "string") return (rawInput.split("\n")[0] ?? "").slice(0, 120);
+  if (typeof rawInput === "string") {
+    return sanitizePermissionText(rawInput.split("\n")[0] ?? "", 120);
+  }
   const command = getStringProperty(rawInput, "command");
-  if (command) return (command.split("\n")[0] ?? "").slice(0, 120);
+  if (command) return sanitizePermissionText(command.split("\n")[0] ?? "", 120);
   const path = getStringProperty(rawInput, "path");
-  if (path) return `${title} ${path}`;
-  return title;
+  if (path) return sanitizePermissionText(`${title} ${path}`, 120);
+  return sanitizePermissionText(title, 120);
 }
 
 function scheduleBubbleUpdate(): void {

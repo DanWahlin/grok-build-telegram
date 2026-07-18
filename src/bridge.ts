@@ -283,15 +283,14 @@ export function createBridge(config: Config): Bridge {
     }
   }
 
-  function cancelPendingPermission(): boolean {
+  function cancelPendingPermission(): Promise<void> | null {
     const pending = takePendingPermission();
-    if (!pending) return false;
+    if (!pending) return null;
     clearTimeout(pending.timer);
     pending.resolve({ outcome: { outcome: "cancelled" } });
-    void expirePermissionCards(pending.summary, pending.messages).catch((error: unknown) => {
+    return expirePermissionCards(pending.summary, pending.messages).catch((error: unknown) => {
       console.warn(`[TG] Pending permission card cleanup failed: ${sanitizedError(error)}`);
     });
-    return true;
   }
 
   async function clearStalePromptCard(active: ActivePromptState | null): Promise<void> {
@@ -604,7 +603,9 @@ export function createBridge(config: Config): Bridge {
     onCancel: async (chatId: number, userId: number, clearQueue: boolean) => {
       const ap = getActivePrompt();
       if (!ap || ap.chatId !== chatId || ap.userId !== userId) {
-        const permissionCancelled = !ap ? await cancelPendingPermission() : false;
+        const permissionCleanup = !ap ? cancelPendingPermission() : null;
+        await permissionCleanup;
+        const permissionCancelled = permissionCleanup !== null;
         if (clearQueue) {
           const cleared = clearPromptQueue();
           for (const item of cleared) {
@@ -617,8 +618,9 @@ export function createBridge(config: Config): Bridge {
       queuePaused = true;
       try {
         markActivePromptCancelling();
-        await cancelPendingPermission();
+        const permissionCleanup = cancelPendingPermission();
         await acpClient.cancelCurrent();
+        await permissionCleanup;
         let idle = await acpClient.waitForIdle(config.CANCEL_WAIT_MS);
         if (!idle) {
           console.warn("[ACP] Cancel wait timed out; restarting ACP to guarantee prompt termination");
@@ -665,7 +667,7 @@ export function createBridge(config: Config): Bridge {
       if (ap && (ap.chatId !== chatId || ap.userId !== userId)) return false;
       queuePaused = true;
       try {
-        await cancelPendingPermission();
+        const permissionCleanup = cancelPendingPermission();
         const cleared = clearPromptQueue();
         for (const item of cleared) {
           cleanupInboxFiles(item.inboxFiles.map((file) => file.path));
@@ -674,6 +676,7 @@ export function createBridge(config: Config): Bridge {
         if (ap) {
           markActivePromptCancelling();
           await acpClient.cancelCurrent();
+          await permissionCleanup;
           const idle = await acpClient.waitForIdle(config.CANCEL_WAIT_MS);
           if (!idle) {
             await acpClient.restart();
@@ -681,6 +684,8 @@ export function createBridge(config: Config): Bridge {
           }
           await waitForPromptTask(config.CANCEL_WAIT_MS);
           clearActivePrompt();
+        } else {
+          await permissionCleanup;
         }
         stopTyping();
         resetStreamDraftState();

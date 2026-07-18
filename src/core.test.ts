@@ -6,6 +6,7 @@ import {
   permissionSelection,
   resolvedPermissionText,
   stalePromptKeyboard,
+  describeTool,
 } from "./telegram.js";
 import { describe, expect, it, vi } from "vitest";
 import type { PermissionOption } from "@agentclientprotocol/sdk";
@@ -63,6 +64,15 @@ describe("Telegram rendering", () => {
     expect(rendered).not.toContain('href="data:');
     expect(rendered).not.toContain('href="vbscript:');
     expect(rendered).toContain("bad (javascript:alert(1)");
+  });
+
+  it("redacts secrets from tool progress descriptions", () => {
+    expect(describeTool(
+      "Run command",
+      { command: "TOKEN=xai-secret npm test" },
+    )).not.toContain("xai-secret");
+    expect(describeTool("Run command", "API_KEY=xai-secret npm test"))
+      .not.toContain("xai-secret");
   });
 });
 
