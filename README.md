@@ -1,3 +1,6 @@
+> [!WARNING]
+> **Deprecated:** This provider-specific bridge is no longer maintained. Use [Agent Telegram Bridge](https://github.com/DanWahlin/agent-telegram-bridge), the shared ACP-based Telegram bridge for Grok Build, GitHub Copilot CLI, and future ACP-compatible agents.
+
 # Grok Build Telegram Bridge
 
 <p align="center">
